@@ -21,7 +21,6 @@ envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
 env_name = envs[1]
 
 def make_env(env_name=env_name, log=False):
-	#env = gym.make("CartPole-v0")
 	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
 	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
 	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
@@ -57,7 +56,6 @@ class PixelAgent(RandomAgent):
 		return self
 
 def run(model, steps=10000, ports=16, eval_at=1000):
-	env = make_env(log=True)
 	num_envs = len(ports) if type(ports) == list else min(ports, 64)
 	logger = Logger(model, env_name, num_envs=num_envs)
 	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
@@ -66,7 +64,7 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 	total_rewards = []
 	for s in range(steps):
 		agent.reset(num_envs)
-		env_actions, actions, states = agent.get_env_action(env, states)
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
 		next_states, rewards, dones, _ = envs.step(env_actions)
 		agent.train(states, actions, next_states, rewards, dones)
 		states = next_states
@@ -77,8 +75,6 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 			agent.save_model(env_name, "checkpoint")
 			if total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
 			logger.log(f"Ep: {s//eval_at}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
-	env.close()
-	envs.close()
 
 if __name__ == "__main__":
 	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent

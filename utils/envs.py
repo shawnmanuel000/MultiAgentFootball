@@ -74,6 +74,9 @@ class EnsembleEnv():
 		for env in self.envs:
 			env.close()
 
+	def __del__(self):
+		self.close()
+
 class EnvWorker(Worker):
 	def __init__(self, self_port, make_env):
 		super().__init__(self_port)
@@ -124,3 +127,6 @@ class EnvManager(Manager):
 	def close(self):
 		self.env.close()
 		self.send_params([pickle.dumps({"cmd": "CLOSE", "item": [0.0]}) for _ in range(self.num_envs)], encoded=True)
+
+	def __del__(self):
+		self.close()
