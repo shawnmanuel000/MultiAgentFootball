@@ -50,10 +50,15 @@ class WorldACAgent(RandomAgent):
 		self.acagent.network.load_model(dirname, name)
 		return self
 
+def make_env():
+	env = gym.make(ENV_NAME)
+	env.env.verbose = 0
+	return env
+
 def run(model, statemodel, runs=1, load_dir="", ports=16):
 	num_envs = len(ports) if type(ports) == list else min(ports, 16)
 	logger = Logger(model, load_dir, statemodel=statemodel, num_envs=num_envs)
-	envs = EnvManager(ENV_NAME, ports) if type(ports) == list else EnsembleEnv(ENV_NAME, ports)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
 	agent = WorldACAgent(envs.action_size, num_envs, model, statemodel, load=load_dir)
 	total_rewards = []
 	for ep in range(runs):
@@ -76,7 +81,7 @@ def run(model, statemodel, runs=1, load_dir="", ports=16):
 
 def trial(model, steps=40000, ports=16):
 	env_name = "Pendulum-v0"
-	envs = EnvManager(ENV_NAME, ports) if type(ports) == list else EnsembleEnv(ENV_NAME, ports)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
 	agent = model(envs.state_size, envs.action_size, decay=0.99)
 	env = gym.make(env_name)
 	state = envs.reset()
@@ -101,7 +106,7 @@ if __name__ == "__main__":
 	if args.trial:
 		trial(model, ports=args.workerports)
 	elif args.selfport is not None:
-		EnvWorker(args.selfport, ENV_NAME).start()
+		EnvWorker(args.selfport, make_env).start()
 	else:
 		if len(args.workerports) == 1: args.workerports = args.workerports[0]
 		run(model, state, args.runs, dirname, args.workerports)

@@ -13,7 +13,7 @@ ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor ne
 CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
 
 DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
-NUM_STEPS = 1000				# The number of steps to collect experience in sequence for each GAE calculation
+NUM_STEPS = 100 				# The number of steps to collect experience in sequence for each GAE calculation
 EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
 EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
 EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
@@ -27,7 +27,7 @@ class Conv(torch.nn.Module):
 		self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
 		self.conv3 = torch.nn.Conv2d(64, 128, kernel_size=4, stride=2)
 		self.conv4 = torch.nn.Conv2d(128, 256, kernel_size=4, stride=2)
-		self.linear1 = torch.nn.Linear(1024, output_size)
+		self.linear1 = torch.nn.Linear(2048, output_size)
 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state):
@@ -58,32 +58,24 @@ class PTActor(torch.nn.Module):
 		return action_mu
 
 class PTCritic(torch.nn.Module):
-	def __init__(self, state_size, action_size):
+	def __init__(self, state_size, action_size=[1]):
 		super().__init__()
 		self.net_state = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
 		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
 		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
-		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, *action_size)
 
-	def forward(self, state, action):
+	def forward(self, state, action=None):
 		state = self.net_state(state).relu()
 		state = self.layer2(state).relu()
 		state = self.layer3(state).relu() + state
 		value = self.value(state)
 		return value
 
-class PTACNetwork():
-	def __init__(self, state_size, action_size, actor=PTActor, critic=PTCritic, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=""): 
+class PTNetwork():
+	def __init__(self, tau=TARGET_UPDATE_RATE, gpu=True): 
 		self.tau = tau
 		self.device = torch.device('cuda' if gpu and torch.cuda.is_available() else 'cpu')
-		self.actor_local = actor(state_size, action_size).to(self.device)
-		self.actor_target = actor(state_size, action_size).to(self.device)
-		self.actor_optimizer = torch.optim.Adam(self.actor_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
-		
-		self.critic_local = critic(state_size, action_size).to(self.device)
-		self.critic_target = critic(state_size, action_size).to(self.device)
-		self.critic_optimizer = torch.optim.Adam(self.critic_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
-		if load: self.load_model(load)
 
 	def init_weights(self, model=None):
 		model = self if model is None else model
@@ -97,6 +89,37 @@ class PTACNetwork():
 	def soft_copy(self, local, target):
 		for t,l in zip(target.parameters(), local.parameters()):
 			t.data.copy_(t.data + self.tau*(l.data - t.data))
+
+class PTQNetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=""): 
+		super().__init__(tau, gpu)
+		self.critic_local = PTCritic(state_size, action_size).to(self.device)
+		self.critic_target = PTCritic(state_size, action_size).to(self.device)
+		self.critic_optimizer = torch.optim.Adam(self.critic_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
+		if load: self.load_model(load)
+
+	def save_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
+		filepath = get_checkpoint_path(net, dirname, name)
+		os.makedirs(os.path.dirname(filepath), exist_ok=True)
+		torch.save(self.critic_local.state_dict(), filepath.replace(".pth", "_c.pth"))
+		
+	def load_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
+		filepath = get_checkpoint_path(net, dirname, name)
+		if os.path.exists(filepath.replace(".pth", "_a.pth")):
+			self.critic_local.load_state_dict(torch.load(filepath.replace(".pth", "_c.pth"), map_location=self.device))
+			self.critic_target.load_state_dict(torch.load(filepath.replace(".pth", "_c.pth"), map_location=self.device))
+
+class PTACNetwork(PTNetwork):
+	def __init__(self, state_size, action_size, actor=PTActor, critic=PTCritic, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=""): 
+		super().__init__(tau, gpu)
+		self.actor_local = actor(state_size, action_size).to(self.device)
+		self.actor_target = actor(state_size, action_size).to(self.device)
+		self.actor_optimizer = torch.optim.Adam(self.actor_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
+		
+		self.critic_local = critic(state_size, action_size).to(self.device)
+		self.critic_target = critic(state_size, action_size).to(self.device)
+		self.critic_optimizer = torch.optim.Adam(self.critic_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
+		if load: self.load_model(load)
 
 	def save_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
 		filepath = get_checkpoint_path(net, dirname, name)
@@ -114,7 +137,7 @@ class PTACNetwork():
 
 class PTACAgent(RandomAgent):
 	def __init__(self, state_size, action_size, network=PTACNetwork, lr=LEARN_RATE, update_freq=NUM_STEPS, eps=EPS_MAX, decay=EPS_DECAY, gpu=True, load=None):
-		super().__init__(action_size)
+		super().__init__(state_size, action_size)
 		self.network = network(state_size, action_size, lr=lr, gpu=gpu, load=load)
 		self.to_tensor = lambda x: torch.from_numpy(np.array(x)).float().to(self.network.device)
 		self.replay_buffer = ReplayBuffer(MAX_BUFFER_SIZE)

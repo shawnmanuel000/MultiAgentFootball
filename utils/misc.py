@@ -7,8 +7,6 @@ import random
 import inspect
 import numpy as np
 import matplotlib.pyplot as plt
-from models.vae import VAE
-from models.mdrnn import MDRNNCell
 
 IMG_DIM = 64					# The height and width to scale the environment image to
 
@@ -24,18 +22,6 @@ def show_image(img, filename="test.png", save=True):
 	if save: plt.imsave(filename, img)
 	plt.imshow(img, cmap=plt.get_cmap('gray'))
 	plt.show()
-
-def load_other(gpu=True):
-	vae_file, rnn_file = [os.path.join("./logs", m, 'best.tar') for m in ['vae', 'mdrnn']]
-	assert os.path.exists(vae_file) and os.path.exists(rnn_file), "Either vae or mdrnn is untrained."
-	vae_state, rnn_state = [torch.load(fname, map_location=torch.device("cpu")) for fname in (vae_file, rnn_file)]
-	vae = VAE(gpu=gpu)
-	mdrnn = MDRNNCell(gpu=gpu)
-	vae.load_state_dict(vae_state['state_dict'])
-	mdrnn.load_state_dict({k.replace('rnn','lstm').replace('_linear','').replace('_l0',''): v for k, v in rnn_state['state_dict'].items()})
-	for m, s in (('VAE', vae_state), ('MDRNN', rnn_state)):
-		print("Loaded {} at epoch {} with test loss {}".format(m, s['epoch'], s['precision']))
-	return vae, mdrnn
 
 def make_video(imgs, dim, filename):
 	video = cv2.VideoWriter(filename, 0, 60, dim)
@@ -62,8 +48,9 @@ def rollout(env, agent, eps=None, render=False, sample=False):
 	with torch.no_grad():
 		while not done:
 			if render: env.render()
-			env_action = agent.get_env_action(env, state, eps, sample)[0]
-			state, reward, done, _ = env.step(env_action.reshape(-1))
+			env_action = agent.get_env_action(env, state[np.newaxis,:], eps, sample)[0]
+			env_action = env_action[0] if hasattr(env.action_space, "n") else env_action.reshape(-1)
+			state, reward, done, _ = env.step(env_action)
 			total_reward += reward
 	return total_reward
 

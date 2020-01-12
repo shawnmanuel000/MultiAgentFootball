@@ -23,7 +23,7 @@ class BrownianNoise:
 		return self.action * scale
 
 class RandomAgent():
-	def __init__(self, action_size):
+	def __init__(self, state_size, action_size, decay=None):
 		self.noise_process = BrownianNoise(action_size)
 
 	def get_action(self, state, eps=None, sample=True):
@@ -32,13 +32,14 @@ class RandomAgent():
 
 	def get_env_action(self, env, state=None, eps=None, sample=True):
 		action = self.get_action(state, eps, sample)
+		if hasattr(env.action_space, "n"): return np.argmax(action, -1), action
 		action_normal = (1+action)/2
 		action_range = env.action_space.high - env.action_space.low
 		env_action = env.action_space.low + np.multiply(action_normal, action_range)
 		return env_action, action
 
 	def train(self, state, action, next_state, reward, done):
-		if done: self.noise_process.reset()
+		if done[0]: self.noise_process.reset()
 
 class ReplayBuffer():
 	def __init__(self, maxlen=None):

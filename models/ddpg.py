@@ -7,7 +7,7 @@ from models.rand import RandomAgent, PrioritizedReplayBuffer, ReplayBuffer
 from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
 
 EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
-EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+EPS_DECAY = 0.95             	# The rate at which eps decays from EPS_MAX to EPS_MIN
 REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
 
 class DDPGActor(torch.nn.Module):
@@ -104,11 +104,11 @@ class DDPGAgent(PTACAgent):
 			next_action = self.network.get_action(next_state, use_target=True, numpy=False)
 			values = self.network.get_q_value(states, actions, use_target=True, numpy=False)
 			next_value = self.network.get_q_value(next_state, next_action, use_target=True, numpy=False)
-			targets, advantages = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values)
-			states, actions, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]).cpu().numpy() for x in (states, actions, targets, advantages)]
-			self.replay_buffer.extend(list(zip(states, actions, targets, advantages)), shuffle=True)	
+			targets, _ = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values)
+			states, actions, targets = [x.view(x.size(0)*x.size(1), *x.size()[2:]).cpu().numpy() for x in (states, actions, targets)]
+			self.replay_buffer.extend(list(zip(states, actions, targets)), shuffle=True)	
 		if len(self.replay_buffer) > 0:
-			(states, actions, targets, advantages), indices, importances = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)
+			(states, actions, targets), indices, importances = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)
 			errors = self.network.optimize(states, actions, targets, importances**(1-self.eps))
 			self.replay_buffer.update_priorities(indices, errors)
 			if done[0]: self.eps = max(self.eps * self.decay, EPS_MIN)
