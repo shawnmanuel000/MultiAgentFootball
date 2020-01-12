@@ -4,13 +4,13 @@ import torch
 import random
 import numpy as np
 from models.rand import RandomAgent, PrioritizedReplayBuffer, ReplayBuffer
-from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
+from utils.network import PTQNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
 
 EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
 EPS_DECAY = 0.95             	# The rate at which eps decays from EPS_MAX to EPS_MIN
 REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
 
-class DDQNetwork(PTACNetwork):
+class DDQNetwork(PTQNetwork):
 	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None): 
 		super().__init__(state_size, action_size, lr=lr, gpu=gpu, load=load)
 
@@ -22,9 +22,10 @@ class DDQNetwork(PTACNetwork):
 	def get_q_value(self, state, action, use_target=False, numpy=True):
 		with torch.no_grad():
 			q_values = self.critic_local(state) if not use_target else self.critic_target(state)
+			out_dims = q_values.size()[:-1]
 			q_values = q_values.reshape(-1, q_values.size(-1))
 			q_indices = action.argmax(-1).reshape(-1)
-			q_selected = q_values[np.arange(q_indices.size(0)), q_indices].reshape(*state.size()[:-1], 1)
+			q_selected = q_values[np.arange(q_indices.size(0)), q_indices].reshape(*out_dims, 1)
 			return q_selected.cpu().numpy() if numpy else q_selected
 	
 	def optimize(self, states, actions, q_targets, importances=1):

@@ -30,8 +30,7 @@ class RawStack():
 
 class ImgStack():
 	def __init__(self, state_size, num_envs=1, stack_len=FRAME_STACK, load="", gpu=True):
-		self.transform = transforms.Compose([transforms.ToPILImage(), transforms.ToTensor()])
-		self.process = lambda x: self.transform(x.astype(np.uint8)).unsqueeze(0).numpy()
+		self.process = lambda x: np.expand_dims(np.transpose(x, (2,0,1)), 0)
 		self.state_size = [*state_size[:-1], state_size[-1]*stack_len]
 		self.stack_len = stack_len
 		self.reset(num_envs)
@@ -48,9 +47,6 @@ class ImgStack():
 
 	def step(self, state, env_action):
 		pass
-
-	def load_model(self, dirname="pytorch", name="best"):
-		return self
 
 class EnsembleEnv():
 	def __init__(self, make_env, num_envs=NUM_ENVS):
@@ -117,13 +113,13 @@ class EnvManager(Manager):
 	def reset(self):
 		self.send_params([pickle.dumps({"cmd": "RESET", "item": [0.0]}) for _ in range(self.num_envs)], encoded=True)
 		states = self.await_results(converter=pickle.loads, decoded=True)
-		return states
+		return np.stack(states)
 
 	def step(self, actions, render=False):
 		self.send_params([pickle.dumps({"cmd": "STEP", "item": action, "render": render}) for action in actions], encoded=True)
 		results = self.await_results(converter=pickle.loads, decoded=True)
-		states, rewards, dones, infos = map(np.stack, zip(*results))
-		return states, rewards, dones, infos
+		obs, rews, dones, infos = zip(*results)
+		return np.stack(obs), np.stack(rews), np.stack(dones), infos
 
 	def close(self):
 		self.env.close()

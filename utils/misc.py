@@ -48,30 +48,30 @@ def rollout(env, agent, eps=None, render=False, sample=False):
 	with torch.no_grad():
 		while not done:
 			if render: env.render()
-			env_action = agent.get_env_action(env, state[np.newaxis,:], eps, sample)[0]
-			env_action = env_action[0] if hasattr(env.action_space, "n") else env_action.reshape(-1)
+			env_action = agent.get_env_action(env, state, eps, sample)[0]
+			env_action = env_action if hasattr(env.action_space, "n") else env_action.reshape(-1)
 			state, reward, done, _ = env.step(env_action)
 			total_reward += reward
 	return total_reward
 
 class Logger():
-	def __init__(self, model_class, load_dir, **kwconfig):
+	def __init__(self, model_class, label, **kwconfig):
 		self.config = kwconfig
-		self.load_dir = load_dir
+		self.label = label
 		self.model_class = model_class
 		self.model_name = inspect.getmodule(model_class).__name__.split(".")[-1]
-		os.makedirs(f"logs/{self.model_name}/{load_dir}/", exist_ok=True)
-		self.run_num = len([n for n in os.listdir(f"logs/{self.model_name}/{load_dir}/")])
+		os.makedirs(f"logs/{self.model_name}/{label}/", exist_ok=True)
+		self.run_num = len([n for n in os.listdir(f"logs/{self.model_name}/{label}/")])
 		self.model_src = [line for line in open(inspect.getabsfile(self.model_class))]
-		self.net_src = [line for line in open(f"utils/network.py") if re.match("^[A-Z]", line)] if self.model_name in ["ddpg", "ppo"] else None
-		self.trn_src = [line for line in open(f"train_a3c.py")] if self.model_name in ["ddpg", "ppo"] else None
-		self.log_path = f"logs/{self.model_name}/{load_dir}/logs_{self.run_num}.txt"
+		self.net_src = [line for line in open(f"utils/network.py") if re.match("^[A-Z]", line)] if self.model_name in ["ddqn", "ddpg", "ppo"] else None
+		self.trn_src = [line for line in open(f"train.py")] if self.model_name in ["ddqn", "ddpg", "ppo"] else None
+		self.log_path = f"logs/{self.model_name}/{label}/logs_{self.run_num}.txt"
 		self.log_num = 0
 
 	def log(self, string, debug=True):
 		with open(self.log_path, "a+") as f:
 			if self.log_num == 0: 
-				f.write(f"Model: {self.model_class}, Dir: {self.load_dir}\n")
+				f.write(f"Model: {self.model_class}, Dir: {self.label}\n")
 				if self.config: f.writelines(" ".join([f"{k}: {v}," for k,v in self.config.items()]) + "\n\n")
 				if self.model_src: f.writelines(self.model_src + ["\n"])
 				if self.net_src: f.writelines(self.net_src + ["\n"])

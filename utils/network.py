@@ -33,12 +33,12 @@ class Conv(torch.nn.Module):
 	def forward(self, state):
 		out_dims = state.size()[:-3]
 		state = state.view(-1, *state.size()[-3:])
-		state = self.conv1(state).tanh() # state: (batch, 32, 31, 31)
-		state = self.conv2(state).tanh() # state: (batch, 64, 14, 14)
-		state = self.conv3(state).tanh() # state: (batch, 128, 6, 6)
-		state = self.conv4(state).tanh() # state: (batch, 256, 2, 2)
-		state = state.view(state.size(0), -1) # state: (batch, 1024)
-		state = self.linear1(state).tanh() # state: (batch, 512)
+		state = self.conv1(state).tanh()
+		state = self.conv2(state).tanh() 
+		state = self.conv3(state).tanh() 
+		state = self.conv4(state).tanh() 
+		state = state.view(state.size(0), -1)
+		state = self.linear1(state).tanh()
 		state = state.view(*out_dims, -1)
 		return state
 
@@ -101,13 +101,13 @@ class PTQNetwork(PTNetwork):
 	def save_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
 		filepath = get_checkpoint_path(net, dirname, name)
 		os.makedirs(os.path.dirname(filepath), exist_ok=True)
-		torch.save(self.critic_local.state_dict(), filepath.replace(".pth", "_c.pth"))
+		torch.save(self.critic_local.state_dict(), filepath)
 		
 	def load_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
 		filepath = get_checkpoint_path(net, dirname, name)
-		if os.path.exists(filepath.replace(".pth", "_a.pth")):
-			self.critic_local.load_state_dict(torch.load(filepath.replace(".pth", "_c.pth"), map_location=self.device))
-			self.critic_target.load_state_dict(torch.load(filepath.replace(".pth", "_c.pth"), map_location=self.device))
+		if os.path.exists(filepath):
+			self.critic_local.load_state_dict(torch.load(filepath, map_location=self.device))
+			self.critic_target.load_state_dict(torch.load(filepath, map_location=self.device))
 
 class PTACNetwork(PTNetwork):
 	def __init__(self, state_size, action_size, actor=PTActor, critic=PTCritic, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=""): 

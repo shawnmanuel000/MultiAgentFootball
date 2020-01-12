@@ -1,0 +1,229 @@
+Model: <class 'models.ppo.PPOAgent'>, Dir: academy_empty_goal_close
+num_envs: 16,
+
+import gym
+import torch
+import pickle
+import argparse
+import numpy as np
+from models.rand import ReplayBuffer, PrioritizedReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, DISCOUNT_RATE, NUM_STEPS, ADVANTAGE_DECAY
+
+EPS_MIN = 0.1                	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.997             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+BATCH_SIZE = 32					# Number of samples to train on for each train step
+PPO_EPOCHS = 2					# Number of iterations to sample batches for training
+ENTROPY_WEIGHT = 0.005			# The weight for the entropy term of the Actor loss
+CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old probabilities
+
+class PPOActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
+		self.action_sig = torch.nn.Parameter(torch.zeros(*action_size))
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		
+	def forward(self, state, action=None, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig.exp().expand_as(action_mu)
+		dist = torch.distributions.Normal(action_mu, action_sig)
+		action = dist.sample() if action is None else action
+		log_prob = dist.log_prob(action)
+		entropy = dist.entropy()
+		return action, log_prob, entropy
+
+class PPOCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu() + state
+		value = self.value(state)
+		return value
+
+class PPONetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPOActor, PPOCritic, lr=lr, gpu=gpu, load=load)
+
+	def get_action_probs(self, state, action_in=None, sample=True, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, log_prob, entropy = self.actor_local(state.to(self.device), action_in, sample)
+			return action if action_in is None else entropy.mean(), log_prob
+
+	def get_value(self, state, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			return self.critic_local(state.to(self.device))
+
+	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=torch.scalar_tensor(1), clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		values = self.get_value(states)
+		critic_error = values - targets
+		critic_loss = importances.to(self.device) * critic_error.pow(2) * scale
+		self.step(self.critic_optimizer, critic_loss.mean())
+
+		entropy, new_log_probs = self.get_action_probs(states, actions)
+		ratio = (new_log_probs - old_log_probs).exp()
+		ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+		actor_loss = -(torch.min(ratio*advantages, ratio_clipped*advantages) + e_weight*entropy) * scale
+		self.step(self.actor_optimizer, actor_loss.mean())
+		return critic_error.cpu().detach().numpy().squeeze(-1)
+
+	def save_model(self, dirname="pytorch", name="best"):
+		super().save_model("ppo", dirname, name)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		super().load_model("ppo", dirname, name)
+
+class PPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		state = self.to_tensor(state)
+		self.action, self.log_prob = [x.cpu().numpy() for x in self.network.get_action_probs(state, sample=sample, grad=False)]
+		return np.tanh(self.action)
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, self.action, self.log_prob, reward, done))
+		update_freq = int(self.update_freq * (1 - self.eps + EPS_MIN)**2)
+		if len(self.buffer) >= update_freq:
+			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			next_state = self.to_tensor(next_state)
+			values = self.network.get_value(states, grad=False)
+			next_value = self.network.get_value(next_state, grad=False)
+			targets, advantages = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values, gamma=DISCOUNT_RATE, lamda=ADVANTAGE_DECAY)
+			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states, actions, log_probs, targets, advantages)]
+			self.replay_buffer.clear().extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
+			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
+				state, action, log_prob, target, advantage = self.replay_buffer.next_batch(BATCH_SIZE, torch.stack)
+				self.network.optimize(state, action, log_prob, target, advantage, scale=8*update_freq/len(self.replay_buffer))
+		if done[0]: self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0002           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 100 				# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+
+import gym
+import argparse
+import numpy as np
+import gfootball.env as ggym
+from collections import deque
+from models.ppo import PPOAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, ImgStack, RawStack
+from utils.misc import Logger, rollout
+
+parser = argparse.ArgumentParser(description="A3C Trainer")
+parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+parser.add_argument("--model", type=str, default="ddqn", choices=["ddqn", "ddpg", "ppo"], help="Which reinforcement learning algorithm to use")
+parser.add_argument("--steps", type=int, default=1000, help="Number of steps to train the agent")
+args = parser.parse_args()
+
+envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
+env_name = envs[1]
+
+def make_env(env_name=env_name, log=False):
+	#env = gym.make("CartPole-v0")
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
+	return env
+
+class PixelAgent(RandomAgent):
+	def __init__(self, state_size, action_size, num_envs, agent, load="", gpu=True, train=True):
+		super().__init__(state_size, action_size)
+		statemodel = RawStack if len(state_size) == 1 else ImgStack
+		self.stack = statemodel(state_size, num_envs, load=load, gpu=gpu)
+		self.agent = agent(self.stack.state_size, action_size, load="" if train else load, gpu=gpu)
+
+	def get_env_action(self, env, state, eps=None, sample=True):
+		state = self.stack.get_state(state)
+		env_action, action = self.agent.get_env_action(env, state, eps, sample)
+		return env_action, action, state
+
+	def train(self, state, action, next_state, reward, done):
+		next_state = self.stack.get_state(next_state)
+		self.agent.train(state, action, next_state, reward, done)
+
+	def reset(self, num_envs=None):
+		num_envs = self.stack.num_envs if num_envs is None else num_envs
+		self.stack.reset(num_envs, restore=False)
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		self.agent.network.save_model(dirname, name)
+
+	def load(self, dirname="pytorch", name="best"):
+		self.stack.load_model(dirname, name)
+		self.agent.network.load_model(dirname, name)
+		return self
+
+def run(model, steps=10000, ports=16, eval_at=1000):
+	env = make_env(log=True)
+	num_envs = len(ports) if type(ports) == list else min(ports, 64)
+	logger = Logger(model, env_name, num_envs=num_envs)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = PixelAgent(envs.state_size, envs.action_size, num_envs, model)
+	states = envs.reset()
+	total_rewards = []
+	for s in range(steps):
+		agent.reset(num_envs)
+		env_actions, actions, states = agent.get_env_action(env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s % eval_at == 0:
+			rollouts = [rollout(envs.env, agent.reset(5)) for _ in range(1)]
+			test_reward = np.mean(rollouts) - np.std(rollouts)
+			total_rewards.append(test_reward)
+			agent.save_model(env_name, "checkpoint")
+			if total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
+			logger.log(f"Ep: {s//eval_at}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
+	env.close()
+	envs.close()
+
+if __name__ == "__main__":
+	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent
+	if args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		if len(args.workerports) == 1: args.workerports = args.workerports[0]
+		run(model, args.steps, args.workerports)
+	print(f"Training finished")
+
+Ep: 0, Reward: 0.0000 [0.00], Avg: 0.0000 (1.000)
+Ep: 1, Reward: 1.0000 [0.00], Avg: 0.5000 (0.979)
+Ep: 2, Reward: 0.0000 [0.00], Avg: 0.3333 (0.967)
+Ep: 3, Reward: 0.0000 [0.00], Avg: 0.2500 (0.942)
+Ep: 4, Reward: 0.0000 [0.00], Avg: 0.2000 (0.914)
+Ep: 5, Reward: 0.0000 [0.00], Avg: 0.1667 (0.906)
+Ep: 6, Reward: -1.0000 [0.00], Avg: 0.0000 (0.884)
+Ep: 7, Reward: 0.0000 [0.00], Avg: 0.0000 (0.863)
+Ep: 8, Reward: 0.0000 [0.00], Avg: 0.0000 (0.853)
+Ep: 9, Reward: 0.0000 [0.00], Avg: 0.0000 (0.843)
