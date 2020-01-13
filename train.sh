@@ -3,7 +3,7 @@ models=([0]="ddqn" [1]="ddpg" [2]="ppo")
 model=$1
 baseport=$2
 workers=16
-steps=10000
+steps=1000000
 
 open_terminal()
 {
@@ -13,7 +13,7 @@ open_terminal()
 		tell app "Terminal" to do script "cd \"`pwd`\"; $script; exit"
 END
 	elif [[ "$OSTYPE" == "linux-gnu" ]]; then # Running on linux
-		xterm -hold -display ":0" -e $script $2 # Add -hold argument after xterm to debug
+		xterm -display ":0" -e $script $2 # Add -hold argument after xterm to debug
 	fi
 }
 

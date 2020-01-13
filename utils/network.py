@@ -13,7 +13,7 @@ ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor ne
 CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
 
 DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
-NUM_STEPS = 100 				# The number of steps to collect experience in sequence for each GAE calculation
+NUM_STEPS = 1000 				# The number of steps to collect experience in sequence for each GAE calculation
 EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
 EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
 EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
@@ -49,6 +49,7 @@ class PTActor(torch.nn.Module):
 		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
 		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
 		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state):
 		state = self.layer1(state).relu() 
@@ -64,11 +65,12 @@ class PTCritic(torch.nn.Module):
 		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
 		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
 		self.value = torch.nn.Linear(CRITIC_HIDDEN, *action_size)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state, action=None):
 		state = self.net_state(state).relu()
 		state = self.layer2(state).relu()
-		state = self.layer3(state).relu() + state
+		state = self.layer3(state).relu()
 		value = self.value(state)
 		return value
 

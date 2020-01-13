@@ -47,7 +47,7 @@ class PPOCritic(torch.nn.Module):
 	def forward(self, state):
 		state = self.layer1(state).relu()
 		state = self.layer2(state).relu()
-		state = self.layer3(state).relu() + state
+		state = self.layer3(state).relu()
 		value = self.value(state)
 		return value
 

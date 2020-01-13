@@ -18,7 +18,7 @@ parser.add_argument("--steps", type=int, default=1000, help="Number of steps to 
 args = parser.parse_args()
 
 envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
-env_name = envs[1]
+env_name = envs[0]
 
 def make_env(env_name=env_name, log=False):
 	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
@@ -68,13 +68,13 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 		next_states, rewards, dones, _ = envs.step(env_actions)
 		agent.train(states, actions, next_states, rewards, dones)
 		states = next_states
-		if s % eval_at == 0:
-			rollouts = [rollout(envs.env, agent.reset(5)) for _ in range(1)]
+		if s % envs.env.unwrapped._config._scenario_cfg.game_duration == 0:
+			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
 			test_reward = np.mean(rollouts) - np.std(rollouts)
 			total_rewards.append(test_reward)
 			agent.save_model(env_name, "checkpoint")
 			if total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
-			logger.log(f"Ep: {s//eval_at}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
+			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
 
 if __name__ == "__main__":
 	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent
