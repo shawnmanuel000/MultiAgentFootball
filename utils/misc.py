@@ -56,6 +56,7 @@ def rollout(env, agent, eps=None, render=False, sample=False):
 
 class Logger():
 	def __init__(self, model_class, label, **kwconfig):
+		models = ["ddqn", "ddpg", "ppo", "rand"]
 		self.config = kwconfig
 		self.label = label
 		self.model_class = model_class
@@ -63,8 +64,8 @@ class Logger():
 		os.makedirs(f"logs/{self.model_name}/{label}/", exist_ok=True)
 		self.run_num = len([n for n in os.listdir(f"logs/{self.model_name}/{label}/")])
 		self.model_src = [line for line in open(inspect.getabsfile(self.model_class))]
-		self.net_src = [line for line in open(f"utils/network.py") if re.match("^[A-Z]", line)] if self.model_name in ["ddqn", "ddpg", "ppo"] else None
-		self.trn_src = [line for line in open(f"train.py")] if self.model_name in ["ddqn", "ddpg", "ppo"] else None
+		self.net_src = [line for line in open(f"utils/network.py") if re.match("^[A-Z]", line)] if self.model_name in models else None
+		self.trn_src = [line for line in open(f"train.py")] if self.model_name in models else None
 		self.log_path = f"logs/{self.model_name}/{label}/logs_{self.run_num}.txt"
 		self.log_num = 0
 

@@ -13,7 +13,7 @@ from utils.misc import Logger, rollout
 parser = argparse.ArgumentParser(description="A3C Trainer")
 parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
 parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
-parser.add_argument("--model", type=str, default="ddqn", choices=["ddqn", "ddpg", "ppo"], help="Which reinforcement learning algorithm to use")
+parser.add_argument("--model", type=str, default="ddpg", choices=["ddqn", "ddpg", "ppo", "rand"], help="Which reinforcement learning algorithm to use")
 parser.add_argument("--steps", type=int, default=1000, help="Number of steps to train the agent")
 args = parser.parse_args()
 
@@ -48,12 +48,7 @@ class PixelAgent(RandomAgent):
 		return self
 
 	def save_model(self, dirname="pytorch", name="best"):
-		self.agent.network.save_model(dirname, name)
-
-	def load(self, dirname="pytorch", name="best"):
-		self.stack.load_model(dirname, name)
-		self.agent.network.load_model(dirname, name)
-		return self
+		if hasattr(self.agent, "network"): self.agent.network.save_model(dirname, name)
 
 def run(model, steps=10000, ports=16, eval_at=1000):
 	num_envs = len(ports) if type(ports) == list else min(ports, 64)
@@ -77,7 +72,7 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
 
 if __name__ == "__main__":
-	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent
+	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent if args.model == "ddqn" else RandomAgent
 	if args.selfport is not None:
 		EnvWorker(args.selfport, make_env).start()
 	else:

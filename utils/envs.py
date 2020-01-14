@@ -25,9 +25,6 @@ class RawStack():
 	def step(self, state, env_action):
 		pass
 
-	def load_model(self, dirname="pytorch", name="best"):
-		return self
-
 class ImgStack():
 	def __init__(self, state_size, num_envs=1, stack_len=FRAME_STACK, load="", gpu=True):
 		self.process = lambda x: np.expand_dims(np.transpose(x, (2,0,1)), 0)

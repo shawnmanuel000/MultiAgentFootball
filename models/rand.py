@@ -23,8 +23,9 @@ class BrownianNoise:
 		return self.action * scale
 
 class RandomAgent():
-	def __init__(self, state_size, action_size, decay=None):
+	def __init__(self, state_size, action_size, **kwargs):
 		self.noise_process = BrownianNoise(action_size)
+		self.eps = 1.0
 
 	def get_action(self, state, eps=None, sample=True):
 		action = self.noise_process.sample(state)
@@ -120,27 +121,3 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 	def reset_priorities(self):
 		for i in range(len(self.priorities)):
 			self.priorities[i] = 1
-
-class NoisyLinear(torch.nn.Linear):
-	def __init__(self, in_features, out_features, sigma_init=0.017, bias=True):
-		super().__init__(in_features, out_features, bias=bias)
-		self.sigma_weight = torch.nn.Parameter(torch.Tensor(out_features, in_features).fill_(sigma_init))
-		self.register_buffer("epsilon_weight", torch.zeros(out_features, in_features))
-		if bias:
-			self.sigma_bias = torch.nn.Parameter(torch.Tensor(out_features).fill_(sigma_init))
-			self.register_buffer("epsilon_bias", torch.zeros(out_features))
-		self.reset_parameters()
-
-	def reset_parameters(self):
-		std = math.sqrt(3 / self.in_features)
-		torch.nn.init.uniform_(self.weight, -std, std)
-		torch.nn.init.uniform_(self.bias, -std, std)
-
-	def forward(self, input):
-		torch.randn(self.epsilon_weight.size(), out=self.epsilon_weight)
-		bias = self.bias
-		if bias is not None:
-			torch.randn(self.epsilon_bias.size(), out=self.epsilon_bias)
-			bias = bias + self.sigma_bias * torch.autograd.Variable(self.epsilon_bias)
-		weight = self.weight + self.sigma_weight * torch.autograd.Variable(self.epsilon_weight)
-		return torch.nn.functional.linear(input, weight, bias)
