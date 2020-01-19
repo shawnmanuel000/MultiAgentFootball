@@ -12,11 +12,12 @@ IMG_DIM = 64					# The height and width to scale the environment image to
 
 def rgb2gray(image):
 	gray = np.dot(image, [0.299, 0.587, 0.114]).astype(np.float32)
-	return gray
+	return np.expand_dims(gray, -1)
 
-def resize(image, dim=IMG_DIM):
-	img = cv2.resize(image, dsize=(dim,dim), interpolation=cv2.INTER_CUBIC)
-	return img
+def resize(image, scale=0.5):
+	dim = (int(image.shape[0]*scale), int(image.shape[1]*scale))
+	img = cv2.resize(image, dsize=dim, interpolation=cv2.INTER_CUBIC)
+	return np.expand_dims(img, -1) if image.shape[-1]==1 else img
 
 def show_image(img, filename="test.png", save=True):
 	if save: plt.imsave(filename, img)

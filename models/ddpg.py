@@ -84,7 +84,7 @@ class DDPGNetwork(PTACNetwork):
 		super().load_model("ddpg", dirname, name)
 
 class DDPGAgent(PTACAgent):
-	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, decay=EPS_DECAY, lr=LEARN_RATE, gpu=True, load=None):
 		super().__init__(state_size, action_size, DDPGNetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
 
 	def get_action(self, state, eps=None, sample=True, e_greedy=False):
@@ -97,7 +97,7 @@ class DDPGAgent(PTACAgent):
 		
 	def train(self, state, action, next_state, reward, done):
 		self.buffer.append((state, action, reward, done))
-		if len(self.buffer) >= int(self.update_freq * (1 - self.eps + EPS_MIN)**0.5):
+		if done[0] or len(self.buffer) >= self.update_freq:
 			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
 			self.buffer.clear()	
 			next_state = self.to_tensor(next_state)
@@ -106,7 +106,7 @@ class DDPGAgent(PTACAgent):
 			next_value = self.network.get_q_value(next_state, next_action, use_target=True, numpy=False)
 			targets, _ = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values)
 			states, actions, targets = [x.view(x.size(0)*x.size(1), *x.size()[2:]).cpu().numpy() for x in (states, actions, targets)]
-			self.replay_buffer.extend(list(zip(states, actions, targets)), shuffle=True)	
+			self.replay_buffer.extend(list(zip(states, actions, targets)), shuffle=False)	
 		if len(self.replay_buffer) > 0:
 			(states, actions, targets), indices, importances = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)
 			errors = self.network.optimize(states, actions, targets, importances**(1-self.eps))

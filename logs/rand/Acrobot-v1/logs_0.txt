@@ -1,0 +1,433 @@
+Model: <class 'models.rand.RandomAgent'>, Dir: Acrobot-v1
+num_envs: 16,
+
+import math
+import torch
+import random
+import numpy as np
+from collections import deque
+from operator import itemgetter
+
+class BrownianNoise:
+	def __init__(self, size, dt=0.02):
+		self.size = size
+		self.dt = dt
+		self.reset()
+
+	def reset(self):
+		self.action = np.clip(np.random.randn(1, *self.size), -1, 1)
+		self.daction_dt = np.random.randn(1, *self.size)
+
+	def sample(self, state=None, scale=1):
+		batch = [state.shape[0]] if state is not None and len(state.shape) in [2,4] else []
+		self.daction_dt = np.random.randn(*batch, *self.size)
+		self.action = self.action[0] if len(self.action) != batch else self.action
+		self.action = np.clip(self.action + math.sqrt(self.dt) * self.daction_dt, -1, 1)
+		return self.action * scale
+
+class RandomAgent():
+	def __init__(self, state_size, action_size, **kwargs):
+		self.noise_process = BrownianNoise(action_size)
+		self.eps = 1.0
+
+	def get_action(self, state, eps=None, sample=True):
+		action = self.noise_process.sample(state)
+		return action
+
+	def get_env_action(self, env, state=None, eps=None, sample=True):
+		action = self.get_action(state, eps, sample)
+		if hasattr(env.action_space, "n"): return np.argmax(action, -1), action
+		action_normal = (1+action)/2
+		action_range = env.action_space.high - env.action_space.low
+		env_action = env.action_space.low + np.multiply(action_normal, action_range)
+		return env_action, action
+
+	def train(self, state, action, next_state, reward, done):
+		if done[0]: self.noise_process.reset()
+
+class ReplayBuffer():
+	def __init__(self, maxlen=None):
+		self.buffer = deque(maxlen=maxlen)
+		
+	def add(self, experience):
+		self.buffer.append(experience)
+		return self
+
+	def extend(self, experiences, shuffle=False):
+		if shuffle: random.shuffle(experiences)
+		for exp in experiences:
+			self.add(exp)
+		return self
+
+	def clear(self):
+		self.buffer.clear()
+		return self
+		
+	def sample(self, batch_size, dtype=np.array, weights=None):
+		sample_size = min(len(self.buffer), batch_size)
+		sample_indices = random.choices(range(len(self.buffer)), k=sample_size, weights=weights)
+		samples = itemgetter(*sample_indices)(self.buffer)
+		sample_arrays = samples if dtype is None else map(dtype, zip(*samples))
+		return sample_arrays, sample_indices, torch.Tensor([1])
+
+	def next_batch(self, batch_size=1, dtype=np.array):
+		if not hasattr(self, "i_batch"): self.i_batch = 0
+		sample_indices = [i%len(self.buffer) for i in range(self.i_batch, self.i_batch+batch_size)]
+		samples = itemgetter(*sample_indices)(self.buffer)
+		self.i_batch = (self.i_batch+batch_size) % len(self.buffer)
+		return map(dtype, zip(*samples))
+
+	def update_priorities(self, indices, errors, offset=0.1):
+		pass
+
+	def reset_priorities(self):
+		pass
+
+	def __len__(self):
+		return len(self.buffer)
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+	def __init__(self, maxlen=None):
+		super().__init__(maxlen)
+		self.priorities = deque(maxlen=maxlen)
+		
+	def add(self, experience):
+		super().add(experience)
+		self.priorities.append(max(self.priorities, default=1))
+		return self
+
+	def clear(self):
+		super().clear()
+		self.priorities.clear()
+		return self
+		
+	def get_probabilities(self, priority_scale):
+		scaled_priorities = np.array(self.priorities) ** priority_scale
+		sample_probabilities = scaled_priorities / sum(scaled_priorities)
+		return sample_probabilities
+	
+	def get_importance(self, probabilities):
+		importance = 1/len(self.buffer) * 1/probabilities
+		importance_normalized = importance / max(importance)
+		return importance_normalized[:,np.newaxis]
+		
+	def sample(self, batch_size, dtype=np.array, priority_scale=0.5):
+		sample_probs = self.get_probabilities(priority_scale)
+		samples, sample_indices, _ = super().sample(batch_size, None, sample_probs)
+		importance = self.get_importance(sample_probs[sample_indices])
+		return map(dtype, zip(*samples)), sample_indices, torch.Tensor(importance)
+						
+	def update_priorities(self, indices, errors, offset=0.1):
+		for i,e in zip(indices, errors):
+			self.priorities[i] = abs(e) + offset
+
+	def reset_priorities(self):
+		for i in range(len(self.priorities)):
+			self.priorities[i] = 1
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0002           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 1000 				# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+
+import gym
+import argparse
+import numpy as np
+# import gfootball.env as ggym
+from collections import deque
+from models.ppo import PPOAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, ImgStack, RawStack
+from utils.misc import Logger, rollout
+
+parser = argparse.ArgumentParser(description="A3C Trainer")
+parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+parser.add_argument("--model", type=str, default="ddqn", choices=["ddqn", "ddpg", "ppo", "rand"], help="Which reinforcement learning algorithm to use")
+parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+args = parser.parse_args()
+
+gym_envs = ["CartPole-v0", "Acrobot-v1", "Pendulum-v0"]
+gfb_envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
+env_name = gym_envs[1]
+
+def make_env(env_name=env_name, log=False):
+	if env_name in gym_envs: return gym.make(env_name)
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
+	env.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
+	return env
+
+class PixelAgent(RandomAgent):
+	def __init__(self, state_size, action_size, num_envs, agent, load="", gpu=True, train=True):
+		super().__init__(state_size, action_size)
+		statemodel = RawStack if len(state_size) == 1 else ImgStack
+		self.stack = statemodel(state_size, num_envs, load=load, gpu=gpu)
+		self.agent = agent(self.stack.state_size, action_size, load="" if train else load, gpu=gpu)
+
+	def get_env_action(self, env, state, eps=None, sample=True):
+		state = self.stack.get_state(state)
+		env_action, action = self.agent.get_env_action(env, state, eps, sample)
+		return env_action, action, state
+
+	def train(self, state, action, next_state, reward, done):
+		next_state = self.stack.get_state(next_state)
+		self.agent.train(state, action, next_state, reward, done)
+
+	def reset(self, num_envs=None):
+		num_envs = self.stack.num_envs if num_envs is None else num_envs
+		self.stack.reset(num_envs, restore=False)
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		if hasattr(self.agent, "network"): self.agent.network.save_model(dirname, name)
+
+def run(model, steps=10000, ports=16, eval_at=1000):
+	num_envs = len(ports) if type(ports) == list else min(ports, 64)
+	logger = Logger(model, env_name, num_envs=num_envs)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = PixelAgent(envs.state_size, envs.action_size, num_envs, model)
+	states = envs.reset()
+	total_rewards = []
+	for s in range(steps):
+		agent.reset(num_envs)
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if dones[0] or s+1 % envs.env.spec.max_episode_steps == 0:
+			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
+			test_reward = np.mean(rollouts) - np.std(rollouts)
+			total_rewards.append(test_reward)
+			agent.save_model(env_name, "checkpoint")
+			if env_name in gfb_envs and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
+			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
+
+if __name__ == "__main__":
+	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent if args.model == "ddqn" else RandomAgent
+	if args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		if len(args.workerports) == 1: args.workerports = args.workerports[0]
+		run(model, args.steps, args.workerports)
+	print(f"Training finished")
+
+Step: 328, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 828, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 1328, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 1828, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 2328, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 2828, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 3328, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 3828, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 4328, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 4828, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 5310, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 5810, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 6310, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 6454, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 6954, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 7454, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 7954, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 8454, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 8954, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 9454, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 9954, Reward: -500.0000 [0.00], Avg: -500.0000 (1.000)
+Step: 10454, Reward: -490.0000 [20.00], Avg: -500.4545 (1.000)
+Step: 10954, Reward: -500.0000 [0.00], Avg: -500.4348 (1.000)
+Step: 11454, Reward: -500.0000 [0.00], Avg: -500.4167 (1.000)
+Step: 11954, Reward: -481.6000 [36.80], Avg: -501.1360 (1.000)
+Step: 12454, Reward: -500.0000 [0.00], Avg: -501.0923 (1.000)
+Step: 12954, Reward: -500.0000 [0.00], Avg: -501.0519 (1.000)
+Step: 13454, Reward: -500.0000 [0.00], Avg: -501.0143 (1.000)
+Step: 13954, Reward: -500.0000 [0.00], Avg: -500.9793 (1.000)
+Step: 14454, Reward: -500.0000 [0.00], Avg: -500.9467 (1.000)
+Step: 14954, Reward: -500.0000 [0.00], Avg: -500.9161 (1.000)
+Step: 15454, Reward: -500.0000 [0.00], Avg: -500.8875 (1.000)
+Step: 15651, Reward: -496.4000 [7.20], Avg: -500.9697 (1.000)
+Step: 16151, Reward: -500.0000 [0.00], Avg: -500.9412 (1.000)
+Step: 16651, Reward: -500.0000 [0.00], Avg: -500.9143 (1.000)
+Step: 17151, Reward: -500.0000 [0.00], Avg: -500.8889 (1.000)
+Step: 17651, Reward: -457.8000 [52.03], Avg: -501.1306 (1.000)
+Step: 18151, Reward: -500.0000 [0.00], Avg: -501.1008 (1.000)
+Step: 18651, Reward: -500.0000 [0.00], Avg: -501.0726 (1.000)
+Step: 19151, Reward: -500.0000 [0.00], Avg: -501.0458 (1.000)
+Step: 19651, Reward: -500.0000 [0.00], Avg: -501.0203 (1.000)
+Step: 20151, Reward: -500.0000 [0.00], Avg: -500.9960 (1.000)
+Step: 20412, Reward: -500.0000 [0.00], Avg: -500.9728 (1.000)
+Step: 20912, Reward: -500.0000 [0.00], Avg: -500.9507 (1.000)
+Step: 21412, Reward: -500.0000 [0.00], Avg: -500.9296 (1.000)
+Step: 21912, Reward: -500.0000 [0.00], Avg: -500.9094 (1.000)
+Step: 22412, Reward: -500.0000 [0.00], Avg: -500.8900 (1.000)
+Step: 22912, Reward: -500.0000 [0.00], Avg: -500.8715 (1.000)
+Step: 23412, Reward: -500.0000 [0.00], Avg: -500.8537 (1.000)
+Step: 23912, Reward: -500.0000 [0.00], Avg: -500.8366 (1.000)
+Step: 24139, Reward: -500.0000 [0.00], Avg: -500.8202 (1.000)
+Step: 24639, Reward: -500.0000 [0.00], Avg: -500.8045 (1.000)
+Step: 25054, Reward: -500.0000 [0.00], Avg: -500.7893 (1.000)
+Step: 25554, Reward: -487.6000 [24.80], Avg: -501.0043 (1.000)
+Step: 26054, Reward: -500.0000 [0.00], Avg: -500.9860 (1.000)
+Step: 26554, Reward: -500.0000 [0.00], Avg: -500.9684 (1.000)
+Step: 27054, Reward: -500.0000 [0.00], Avg: -500.9514 (1.000)
+Step: 27380, Reward: -500.0000 [0.00], Avg: -500.9350 (1.000)
+Step: 27880, Reward: -500.0000 [0.00], Avg: -500.9192 (1.000)
+Step: 28380, Reward: -500.0000 [0.00], Avg: -500.9039 (1.000)
+Step: 28604, Reward: -500.0000 [0.00], Avg: -500.8891 (1.000)
+Step: 29104, Reward: -500.0000 [0.00], Avg: -500.8747 (1.000)
+Step: 29604, Reward: -480.0000 [23.36], Avg: -500.9141 (1.000)
+Step: 30104, Reward: -500.0000 [0.00], Avg: -500.8998 (1.000)
+Step: 30604, Reward: -500.0000 [0.00], Avg: -500.8860 (1.000)
+Step: 31104, Reward: -500.0000 [0.00], Avg: -500.8726 (1.000)
+Step: 31604, Reward: -500.0000 [0.00], Avg: -500.8596 (1.000)
+Step: 32074, Reward: -500.0000 [0.00], Avg: -500.8469 (1.000)
+Step: 32574, Reward: -500.0000 [0.00], Avg: -500.8346 (1.000)
+Step: 33074, Reward: -500.0000 [0.00], Avg: -500.8227 (1.000)
+Step: 33468, Reward: -500.0000 [0.00], Avg: -500.8111 (1.000)
+Step: 33968, Reward: -498.6000 [2.80], Avg: -500.8193 (1.000)
+Step: 34468, Reward: -500.0000 [0.00], Avg: -500.8081 (1.000)
+Step: 34968, Reward: -500.0000 [0.00], Avg: -500.7972 (1.000)
+Step: 35468, Reward: -500.0000 [0.00], Avg: -500.7865 (1.000)
+Step: 35968, Reward: -500.0000 [0.00], Avg: -500.7762 (1.000)
+Step: 36468, Reward: -500.0000 [0.00], Avg: -500.7661 (1.000)
+Step: 36968, Reward: -500.0000 [0.00], Avg: -500.7563 (1.000)
+Step: 37468, Reward: -500.0000 [0.00], Avg: -500.7467 (1.000)
+Step: 37968, Reward: -500.0000 [0.00], Avg: -500.7374 (1.000)
+Step: 38468, Reward: -500.0000 [0.00], Avg: -500.7283 (1.000)
+Step: 38765, Reward: -500.0000 [0.00], Avg: -500.7194 (1.000)
+Step: 39265, Reward: -500.0000 [0.00], Avg: -500.7107 (1.000)
+Step: 39765, Reward: -500.0000 [0.00], Avg: -500.7023 (1.000)
+Step: 40265, Reward: -500.0000 [0.00], Avg: -500.6940 (1.000)
+Step: 40765, Reward: -500.0000 [0.00], Avg: -500.6859 (1.000)
+Step: 41265, Reward: -500.0000 [0.00], Avg: -500.6781 (1.000)
+Step: 41765, Reward: -500.0000 [0.00], Avg: -500.6703 (1.000)
+Step: 42265, Reward: -500.0000 [0.00], Avg: -500.6628 (1.000)
+Step: 42765, Reward: -491.8000 [16.40], Avg: -500.7466 (1.000)
+Step: 43152, Reward: -479.4000 [41.20], Avg: -500.9647 (1.000)
+Step: 43652, Reward: -500.0000 [0.00], Avg: -500.9542 (1.000)
+Step: 44152, Reward: -500.0000 [0.00], Avg: -500.9440 (1.000)
+Step: 44652, Reward: -500.0000 [0.00], Avg: -500.9339 (1.000)
+Step: 45152, Reward: -500.0000 [0.00], Avg: -500.9241 (1.000)
+Step: 45652, Reward: -500.0000 [0.00], Avg: -500.9145 (1.000)
+Step: 46034, Reward: -500.0000 [0.00], Avg: -500.9051 (1.000)
+Step: 46534, Reward: -500.0000 [0.00], Avg: -500.8958 (1.000)
+Step: 47034, Reward: -500.0000 [0.00], Avg: -500.8868 (1.000)
+Step: 47534, Reward: -493.6000 [12.80], Avg: -500.9419 (1.000)
+Step: 48034, Reward: -500.0000 [0.00], Avg: -500.9326 (1.000)
+Step: 48534, Reward: -500.0000 [0.00], Avg: -500.9234 (1.000)
+Step: 49034, Reward: -500.0000 [0.00], Avg: -500.9145 (1.000)
+Step: 49534, Reward: -500.0000 [0.00], Avg: -500.9057 (1.000)
+Step: 50034, Reward: -500.0000 [0.00], Avg: -500.8971 (1.000)
+Step: 50534, Reward: -500.0000 [0.00], Avg: -500.8886 (1.000)
+Step: 51034, Reward: -500.0000 [0.00], Avg: -500.8803 (1.000)
+Step: 51534, Reward: -500.0000 [0.00], Avg: -500.8721 (1.000)
+Step: 51847, Reward: -492.8000 [14.40], Avg: -500.9302 (1.000)
+Step: 52347, Reward: -500.0000 [0.00], Avg: -500.9217 (1.000)
+Step: 52847, Reward: -500.0000 [0.00], Avg: -500.9134 (1.000)
+Step: 53347, Reward: -500.0000 [0.00], Avg: -500.9053 (1.000)
+Step: 53847, Reward: -500.0000 [0.00], Avg: -500.8973 (1.000)
+Step: 54347, Reward: -500.0000 [0.00], Avg: -500.8894 (1.000)
+Step: 54847, Reward: -500.0000 [0.00], Avg: -500.8817 (1.000)
+Step: 55347, Reward: -500.0000 [0.00], Avg: -500.8741 (1.000)
+Step: 55847, Reward: -500.0000 [0.00], Avg: -500.8666 (1.000)
+Step: 56347, Reward: -500.0000 [0.00], Avg: -500.8592 (1.000)
+Step: 56847, Reward: -500.0000 [0.00], Avg: -500.8520 (1.000)
+Step: 57347, Reward: -500.0000 [0.00], Avg: -500.8449 (1.000)
+Step: 57847, Reward: -500.0000 [0.00], Avg: -500.8379 (1.000)
+Step: 58347, Reward: -500.0000 [0.00], Avg: -500.8311 (1.000)
+Step: 58847, Reward: -500.0000 [0.00], Avg: -500.8243 (1.000)
+Step: 59347, Reward: -500.0000 [0.00], Avg: -500.8177 (1.000)
+Step: 59847, Reward: -500.0000 [0.00], Avg: -500.8111 (1.000)
+Step: 60347, Reward: -500.0000 [0.00], Avg: -500.8047 (1.000)
+Step: 60847, Reward: -500.0000 [0.00], Avg: -500.7983 (1.000)
+Step: 61347, Reward: -500.0000 [0.00], Avg: -500.7921 (1.000)
+Step: 61847, Reward: -500.0000 [0.00], Avg: -500.7860 (1.000)
+Step: 62347, Reward: -500.0000 [0.00], Avg: -500.7799 (1.000)
+Step: 62847, Reward: -500.0000 [0.00], Avg: -500.7740 (1.000)
+Step: 63347, Reward: -500.0000 [0.00], Avg: -500.7681 (1.000)
+Step: 63847, Reward: -500.0000 [0.00], Avg: -500.7623 (1.000)
+Step: 64347, Reward: -500.0000 [0.00], Avg: -500.7566 (1.000)
+Step: 64847, Reward: -497.2000 [5.60], Avg: -500.7718 (1.000)
+Step: 65226, Reward: -500.0000 [0.00], Avg: -500.7661 (1.000)
+Step: 65469, Reward: -500.0000 [0.00], Avg: -500.7605 (1.000)
+Step: 65969, Reward: -500.0000 [0.00], Avg: -500.7550 (1.000)
+Step: 66469, Reward: -500.0000 [0.00], Avg: -500.7496 (1.000)
+Step: 66969, Reward: -500.0000 [0.00], Avg: -500.7442 (1.000)
+Step: 67469, Reward: -500.0000 [0.00], Avg: -500.7389 (1.000)
+Step: 67969, Reward: -500.0000 [0.00], Avg: -500.7337 (1.000)
+Step: 68469, Reward: -500.0000 [0.00], Avg: -500.7286 (1.000)
+Step: 68969, Reward: -500.0000 [0.00], Avg: -500.7235 (1.000)
+Step: 69469, Reward: -500.0000 [0.00], Avg: -500.7186 (1.000)
+Step: 69969, Reward: -500.0000 [0.00], Avg: -500.7136 (1.000)
+Step: 70469, Reward: -491.2000 [17.60], Avg: -500.7686 (1.000)
+Step: 70969, Reward: -500.0000 [0.00], Avg: -500.7634 (1.000)
+Step: 71295, Reward: -480.4000 [39.20], Avg: -500.8899 (1.000)
+Step: 71795, Reward: -500.0000 [0.00], Avg: -500.8839 (1.000)
+Step: 72295, Reward: -500.0000 [0.00], Avg: -500.8781 (1.000)
+Step: 72561, Reward: -500.0000 [0.00], Avg: -500.8723 (1.000)
+Step: 73061, Reward: -500.0000 [0.00], Avg: -500.8666 (1.000)
+Step: 73561, Reward: -491.4000 [17.20], Avg: -500.9168 (1.000)
+Step: 73970, Reward: -499.0000 [2.00], Avg: -500.9174 (1.000)
+Step: 74470, Reward: -500.0000 [0.00], Avg: -500.9115 (1.000)
+Step: 74970, Reward: -500.0000 [0.00], Avg: -500.9057 (1.000)
+Step: 75470, Reward: -500.0000 [0.00], Avg: -500.8999 (1.000)
+Step: 75970, Reward: -500.0000 [0.00], Avg: -500.8943 (1.000)
+Step: 76470, Reward: -500.0000 [0.00], Avg: -500.8887 (1.000)
+Step: 76914, Reward: -500.0000 [0.00], Avg: -500.8832 (1.000)
+Step: 77414, Reward: -500.0000 [0.00], Avg: -500.8777 (1.000)
+Step: 77914, Reward: -500.0000 [0.00], Avg: -500.8723 (1.000)
+Step: 78414, Reward: -500.0000 [0.00], Avg: -500.8670 (1.000)
+Step: 78722, Reward: -500.0000 [0.00], Avg: -500.8618 (1.000)
+Step: 79222, Reward: -500.0000 [0.00], Avg: -500.8566 (1.000)
+Step: 79722, Reward: -500.0000 [0.00], Avg: -500.8514 (1.000)
+Step: 80222, Reward: -500.0000 [0.00], Avg: -500.8464 (1.000)
+Step: 80722, Reward: -500.0000 [0.00], Avg: -500.8414 (1.000)
+Step: 81222, Reward: -500.0000 [0.00], Avg: -500.8364 (1.000)
+Step: 81722, Reward: -500.0000 [0.00], Avg: -500.8315 (1.000)
+Step: 82141, Reward: -488.0000 [24.00], Avg: -500.8965 (1.000)
+Step: 82641, Reward: -489.0000 [22.00], Avg: -500.9549 (1.000)
+Step: 83141, Reward: -500.0000 [0.00], Avg: -500.9494 (1.000)
+Step: 83641, Reward: -500.0000 [0.00], Avg: -500.9439 (1.000)
+Step: 84141, Reward: -500.0000 [0.00], Avg: -500.9386 (1.000)
+Step: 84641, Reward: -464.0000 [72.00], Avg: -501.1367 (1.000)
+Step: 84870, Reward: -500.0000 [0.00], Avg: -501.1303 (1.000)
+Step: 85370, Reward: -500.0000 [0.00], Avg: -501.1240 (1.000)
+Step: 85823, Reward: -500.0000 [0.00], Avg: -501.1177 (1.000)
+Step: 86323, Reward: -500.0000 [0.00], Avg: -501.1115 (1.000)
+Step: 86823, Reward: -500.0000 [0.00], Avg: -501.1054 (1.000)
+Step: 87323, Reward: -500.0000 [0.00], Avg: -501.0994 (1.000)
+Step: 87823, Reward: -500.0000 [0.00], Avg: -501.0934 (1.000)
+Step: 88323, Reward: -500.0000 [0.00], Avg: -501.0875 (1.000)
+Step: 88823, Reward: -500.0000 [0.00], Avg: -501.0817 (1.000)
+Step: 89323, Reward: -500.0000 [0.00], Avg: -501.0759 (1.000)
+Step: 89823, Reward: -500.0000 [0.00], Avg: -501.0702 (1.000)
+Step: 90316, Reward: -493.6000 [12.80], Avg: -501.0984 (1.000)
+Step: 90816, Reward: -500.0000 [0.00], Avg: -501.0926 (1.000)
+Step: 91316, Reward: -500.0000 [0.00], Avg: -501.0869 (1.000)
+Step: 91816, Reward: -500.0000 [0.00], Avg: -501.0812 (1.000)
+Step: 92316, Reward: -500.0000 [0.00], Avg: -501.0756 (1.000)
+Step: 92816, Reward: -500.0000 [0.00], Avg: -501.0701 (1.000)
+Step: 93316, Reward: -500.0000 [0.00], Avg: -501.0646 (1.000)
+Step: 93816, Reward: -494.2000 [11.60], Avg: -501.0887 (1.000)
+Step: 94316, Reward: -500.0000 [0.00], Avg: -501.0832 (1.000)
+Step: 94816, Reward: -500.0000 [0.00], Avg: -501.0777 (1.000)
+Step: 95316, Reward: -500.0000 [0.00], Avg: -501.0723 (1.000)
+Step: 95816, Reward: -473.8000 [52.40], Avg: -501.1980 (1.000)
+Step: 96244, Reward: -500.0000 [0.00], Avg: -501.1920 (1.000)
+Step: 96744, Reward: -500.0000 [0.00], Avg: -501.1861 (1.000)
+Step: 97244, Reward: -500.0000 [0.00], Avg: -501.1802 (1.000)
+Step: 97744, Reward: -500.0000 [0.00], Avg: -501.1745 (1.000)
+Step: 98244, Reward: -500.0000 [0.00], Avg: -501.1687 (1.000)
+Step: 98744, Reward: -500.0000 [0.00], Avg: -501.1631 (1.000)
+Step: 99244, Reward: -500.0000 [0.00], Avg: -501.1574 (1.000)
+Step: 99744, Reward: -500.0000 [0.00], Avg: -501.1519 (1.000)

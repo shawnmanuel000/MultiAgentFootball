@@ -5,7 +5,7 @@ import numpy as np
 from collections import deque
 from torchvision import transforms
 from utils.multiprocess import Manager, Worker
-from utils.misc import IMG_DIM
+from utils.misc import rgb2gray, resize
 
 FRAME_STACK = 2					# The number of consecutive image states to combine for training a3c on raw images
 NUM_ENVS = 16					# The default number of environments to simultaneously train the a3c in parallel
@@ -27,8 +27,8 @@ class RawStack():
 
 class ImgStack():
 	def __init__(self, state_size, num_envs=1, stack_len=FRAME_STACK, load="", gpu=True):
-		self.process = lambda x: np.expand_dims(np.transpose(x, (2,0,1)), 0)
-		self.state_size = [*state_size[:-1], state_size[-1]*stack_len]
+		self.process = lambda x: np.expand_dims(np.transpose(resize(rgb2gray(x) if x.shape[-1] == 3 else x), (2,0,1)), 0)
+		self.state_size = [*self.process(np.zeros(state_size)).shape[-2:], (1 if state_size[-1]==3 else state_size[-1])*stack_len]
 		self.stack_len = stack_len
 		self.reset(num_envs)
 
@@ -49,7 +49,7 @@ class EnsembleEnv():
 	def __init__(self, make_env, num_envs=NUM_ENVS):
 		self.env = make_env()
 		self.envs = [make_env() for _ in range(num_envs)]
-		self.state_size = self.env.observation_space.shape
+		self.state_size = [self.env.observation_space.n] if hasattr(self.env.observation_space, "n") else self.env.observation_space.shape
 		self.action_size = [self.env.action_space.n] if hasattr(self.env.action_space, "n") else self.env.action_space.shape
 
 	def reset(self):
@@ -107,7 +107,7 @@ class EnvManager(Manager):
 		super().__init__(client_ports=client_ports)
 		self.num_envs = len(client_ports)
 		self.env = make_env()
-		self.state_size = self.env.observation_space.shape
+		self.state_size = [self.env.observation_space.n] if hasattr(self.env.observation_space, "n") else self.env.observation_space.shape
 		self.action_size = [self.env.action_space.n] if hasattr(self.env.action_space, "n") else self.env.action_space.shape
 
 	def reset(self):

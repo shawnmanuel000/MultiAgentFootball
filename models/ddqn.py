@@ -7,7 +7,7 @@ from models.rand import RandomAgent, PrioritizedReplayBuffer, ReplayBuffer
 from utils.network import PTQNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
 
 EPS_MIN = 0.020              	# The lower limit proportion of random to greedy actions to take
-EPS_DECAY = 0.99             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+EPS_DECAY = 0.98             	# The rate at which eps decays from EPS_MAX to EPS_MIN
 REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
 
 class DDQNetwork(PTQNetwork):
@@ -17,7 +17,7 @@ class DDQNetwork(PTQNetwork):
 	def get_action(self, state, use_target=False, numpy=True, sample=True):
 		with torch.no_grad():
 			q_values = self.critic_local(state) if not use_target else self.critic_target(state)
-			return q_values.cpu().numpy() if numpy else q_values
+			return q_values.softmax(-1).cpu().numpy() if numpy else q_values.softmax(-1)
 
 	def get_q_value(self, state, action, use_target=False, numpy=True):
 		with torch.no_grad():
@@ -55,7 +55,7 @@ class DDQNAgent(PTACAgent):
 		
 	def train(self, state, action, next_state, reward, done):
 		self.buffer.append((state, action, reward, done))
-		if len(self.buffer) >= int(self.update_freq * (1 - self.eps + EPS_MIN)**0.5):
+		if done[0] or len(self.buffer) >= self.update_freq:
 			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
 			self.buffer.clear()	
 			next_state = self.to_tensor(next_state)

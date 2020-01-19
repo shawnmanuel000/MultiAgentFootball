@@ -6,8 +6,6 @@ import numpy as np
 from models.rand import ReplayBuffer, PrioritizedReplayBuffer
 from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, DISCOUNT_RATE, NUM_STEPS, ADVANTAGE_DECAY
 
-EPS_MIN = 0.1                	# The lower limit proportion of random to greedy actions to take
-EPS_DECAY = 0.997             	# The rate at which eps decays from EPS_MAX to EPS_MIN
 BATCH_SIZE = 32					# Number of samples to train on for each train step
 PPO_EPOCHS = 2					# Number of iterations to sample batches for training
 ENTROPY_WEIGHT = 0.005			# The weight for the entropy term of the Actor loss
@@ -84,8 +82,8 @@ class PPONetwork(PTACNetwork):
 		super().load_model("ppo", dirname, name)
 
 class PPOAgent(PTACAgent):
-	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
-		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
 
 	def get_action(self, state, eps=None, sample=True):
 		state = self.to_tensor(state)
@@ -94,8 +92,7 @@ class PPOAgent(PTACAgent):
 
 	def train(self, state, action, next_state, reward, done):
 		self.buffer.append((state, self.action, self.log_prob, reward, done))
-		update_freq = int(self.update_freq * (1 - self.eps + EPS_MIN)**2)
-		if len(self.buffer) >= update_freq:
+		if done[0] or len(self.buffer) >= self.update_freq:
 			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
 			self.buffer.clear()
 			next_state = self.to_tensor(next_state)
@@ -106,5 +103,4 @@ class PPOAgent(PTACAgent):
 			self.replay_buffer.clear().extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
 			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
 				state, action, log_prob, target, advantage = self.replay_buffer.next_batch(BATCH_SIZE, torch.stack)
-				self.network.optimize(state, action, log_prob, target, advantage, scale=8*update_freq/len(self.replay_buffer))
-		if done[0]: self.eps = max(self.eps * self.decay, EPS_MIN)
+				self.network.optimize(state, action, log_prob, target, advantage, scale=16*dones.size(0)/len(self.replay_buffer))

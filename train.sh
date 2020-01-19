@@ -1,9 +1,9 @@
-models=([0]="ddqn" [1]="ddpg" [2]="ppo")
+models=([0]="ddqn" [1]="ddpg" [2]="ppo", [3]="rand")
 
-model=$1
-baseport=$2
+steps=$1
+model=$2
+baseport=$3
 workers=16
-steps=1000000
 
 open_terminal()
 {

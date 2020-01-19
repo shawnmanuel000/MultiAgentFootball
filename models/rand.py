@@ -2,6 +2,7 @@ import math
 import torch
 import random
 import numpy as np
+import scipy.special as sps
 from collections import deque
 from operator import itemgetter
 
@@ -16,8 +17,8 @@ class BrownianNoise:
 		self.daction_dt = np.random.randn(1, *self.size)
 
 	def sample(self, state=None, scale=1):
-		batch = state.shape[0] if state is not None and len(state.shape) in [2,4] else 1
-		self.daction_dt = np.random.randn(batch, *self.size)
+		batch = [state.shape[0]] if state is not None and len(state.shape) in [2,4] else []
+		self.daction_dt = np.random.randn(*batch, *self.size)
 		self.action = self.action[0] if len(self.action) != batch else self.action
 		self.action = np.clip(self.action + math.sqrt(self.dt) * self.daction_dt, -1, 1)
 		return self.action * scale
@@ -34,9 +35,8 @@ class RandomAgent():
 	def get_env_action(self, env, state=None, eps=None, sample=True):
 		action = self.get_action(state, eps, sample)
 		if hasattr(env.action_space, "n"): return np.argmax(action, -1), action
-		action_normal = (1+action)/2
 		action_range = env.action_space.high - env.action_space.low
-		env_action = env.action_space.low + np.multiply(action_normal, action_range)
+		env_action = env.action_space.low + np.multiply((1+action)/2, action_range)
 		return env_action, action
 
 	def train(self, state, action, next_state, reward, done):
@@ -58,6 +58,7 @@ class ReplayBuffer():
 
 	def clear(self):
 		self.buffer.clear()
+		self.i_batch = 0
 		return self
 		
 	def sample(self, batch_size, dtype=np.array, weights=None):

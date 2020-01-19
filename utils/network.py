@@ -6,14 +6,14 @@ import numpy as np
 from models.rand import RandomAgent, ReplayBuffer
 
 REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
-LEARN_RATE = 0.0002           	# Sets how much we want to update the network weights at each training step
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
 TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
 INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
 ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
 CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
 
 DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
-NUM_STEPS = 1000 				# The number of steps to collect experience in sequence for each GAE calculation
+NUM_STEPS = 500 				# The number of steps to collect experience in sequence for each GAE calculation
 EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
 EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
 EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
@@ -27,7 +27,7 @@ class Conv(torch.nn.Module):
 		self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
 		self.conv3 = torch.nn.Conv2d(64, 128, kernel_size=4, stride=2)
 		self.conv4 = torch.nn.Conv2d(128, 256, kernel_size=4, stride=2)
-		self.linear1 = torch.nn.Linear(2048, output_size)
+		self.linear1 = torch.nn.Linear(self.get_conv_output(state_size), output_size)
 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state):
@@ -42,35 +42,40 @@ class Conv(torch.nn.Module):
 		state = state.view(*out_dims, -1)
 		return state
 
+	def get_conv_output(self, state_size):
+		inputs = torch.randn(1, state_size[-1], *state_size[:-1])
+		output = self.conv4(self.conv3(self.conv2(self.conv1(inputs))))
+		return np.prod(output.size())
+
 class PTActor(torch.nn.Module):
 	def __init__(self, state_size, action_size):
 		super().__init__()
-		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
-		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
-		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.state_fc1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.state_fc2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.state_fc3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
 		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state):
-		state = self.layer1(state).relu() 
-		state = self.layer2(state).relu() 
-		state = self.layer3(state).relu() 
+		state = self.state_fc1(state).relu() 
+		state = self.state_fc2(state).relu() 
+		state = self.state_fc3(state).relu() 
 		action_mu = self.action_mu(state)
 		return action_mu
 
 class PTCritic(torch.nn.Module):
 	def __init__(self, state_size, action_size=[1]):
 		super().__init__()
-		self.net_state = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
-		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
-		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.state_fc1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.state_fc2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.state_fc3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
 		self.value = torch.nn.Linear(CRITIC_HIDDEN, *action_size)
 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 
 	def forward(self, state, action=None):
-		state = self.net_state(state).relu()
-		state = self.layer2(state).relu()
-		state = self.layer3(state).relu()
+		state = self.state_fc1(state).relu()
+		state = self.state_fc2(state).relu()
+		state = self.state_fc3(state).relu()
 		value = self.value(state)
 		return value
 

@@ -4,6 +4,10 @@ import numpy as np
 import matplotlib.pylab as plt
 from collections import deque
 
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "11_vs_11_stochastic"]
+env_name = gym_envs[2]
+
 def read_log(path):
 	steps = []
 	rewards = []
@@ -19,26 +23,28 @@ def read_log(path):
 				rolling.append(np.mean(averages))
 	return steps, rewards, rolling
 
-def graph_logs(env_name="11_vs_11_stochastic"):
-	models = ["ddpg", "ddqn", "ppo", "rand"]
-	steps, rewards, averages = zip(*[read_log(f"./{model}/{env_name}/logs_0.txt") for model in models])
-	plt.plot(steps[3], rewards[3], color="#CCCCCC", linewidth=0.5)
-	plt.plot(steps[0], rewards[0], color="#ADFF2F", linewidth=0.5)
-	plt.plot(steps[1], rewards[1], color="#00BFFF", linewidth=0.5)
-	plt.plot(steps[2], rewards[2], color="#FF1493", linewidth=0.5)
-	plt.plot(steps[3], averages[3], color="#999999", label="Avg Random")
-	plt.plot(steps[0], averages[0], color="#008000", label="Avg DDPG")
-	plt.plot(steps[1], averages[1], color="#0000CD", label="Avg DDQN")
-	plt.plot(steps[2], averages[2], color="#FF0000", label="Avg PPO")
-	
-	plt.legend(loc="best")
-	plt.title(f"Training Rewards")
-	plt.xlabel("Step")
-	plt.ylabel("Total Score")
-	plt.grid(linewidth=0.3, linestyle='-')
+def graph_logs(env_name=env_name):
+	models = ["ppo", "ddpg", "ddqn", "rand"]
+	light_cols = {"ddqn":"#ADFF2F", "ddpg":"#00BFFF", "ppo":"#FF1493", "rand":"#CCCCCC"}
+	dark_cols = {"ddqn":"#008000", "ddpg":"#0000CD", "ppo":"#FF0000", "rand":"#999999"}
+	for model in reversed(models):
+		if os.path.exists(f"./{model}/{env_name}/"):
+			steps, rewards, averages = read_log(f"./{model}/{env_name}/" + sorted(os.listdir(f"./{model}/{env_name}/"))[-1])
+			plt.plot(steps, rewards, color=light_cols[model], linewidth=0.25, zorder=0)
+			plt.plot(steps, averages, color=dark_cols[model], label=f"Avg {model.upper()}", zorder=1)
+	try: 
+		steps
+		plt.legend(loc="best")
+		plt.title(f"Training Rewards for {env_name}")
+		plt.xlabel("Step")
+		plt.ylabel("Total Reward")
+		plt.grid(linewidth=0.3, linestyle='-')
+		plt.show()
+	except NameError:
+		pass
 
 def main():
-	graph_logs()
-	plt.show()
+	for env_name in gym_envs: 
+		graph_logs(env_name)
 
 main()

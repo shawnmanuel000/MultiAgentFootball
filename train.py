@@ -1,7 +1,7 @@
 import gym
 import argparse
 import numpy as np
-import gfootball.env as ggym
+# import gfootball.env as ggym
 from collections import deque
 from models.ppo import PPOAgent
 from models.ddqn import DDQNAgent
@@ -14,19 +14,22 @@ parser = argparse.ArgumentParser(description="A3C Trainer")
 parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
 parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
 parser.add_argument("--model", type=str, default="ddpg", choices=["ddqn", "ddpg", "ppo", "rand"], help="Which reinforcement learning algorithm to use")
-parser.add_argument("--steps", type=int, default=1000, help="Number of steps to train the agent")
+parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
 args = parser.parse_args()
 
-envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
-env_name = envs[0]
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
+env_name = gym_envs[5]
 
 def make_env(env_name=env_name, log=False):
+	if env_name in gym_envs: return gym.make(env_name)
 	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
 	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
+	env.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
 	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
 	return env
 
-class PixelAgent(RandomAgent):
+class AsyncAgent(RandomAgent):
 	def __init__(self, state_size, action_size, num_envs, agent, load="", gpu=True, train=True):
 		super().__init__(state_size, action_size)
 		statemodel = RawStack if len(state_size) == 1 else ImgStack
@@ -52,9 +55,9 @@ class PixelAgent(RandomAgent):
 
 def run(model, steps=10000, ports=16, eval_at=1000):
 	num_envs = len(ports) if type(ports) == list else min(ports, 64)
-	logger = Logger(model, env_name, num_envs=num_envs)
 	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
-	agent = PixelAgent(envs.state_size, envs.action_size, num_envs, model)
+	agent = AsyncAgent(envs.state_size, envs.action_size, num_envs, model)
+	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.stack.state_size, action_size=envs.action_size)
 	states = envs.reset()
 	total_rewards = []
 	for s in range(steps):
@@ -63,12 +66,12 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 		next_states, rewards, dones, _ = envs.step(env_actions)
 		agent.train(states, actions, next_states, rewards, dones)
 		states = next_states
-		if s % envs.env.unwrapped._config._scenario_cfg.game_duration == 0:
+		if dones[0]:
 			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
 			test_reward = np.mean(rollouts) - np.std(rollouts)
 			total_rewards.append(test_reward)
 			agent.save_model(env_name, "checkpoint")
-			if total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
+			if env_name in gfb_envs and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
 			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
 
 if __name__ == "__main__":
