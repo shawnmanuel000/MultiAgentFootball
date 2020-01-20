@@ -23,7 +23,8 @@ def read_log(path):
 				rolling.append(np.mean(averages))
 	return steps, rewards, rolling
 
-def graph_logs(env_name=env_name):
+def graph_logs(env_name=env_name, show=False):
+	plt.figure()
 	models = ["ppo", "ddpg", "ddqn", "rand"]
 	light_cols = {"ddqn":"#ADFF2F", "ddpg":"#00BFFF", "ppo":"#FF1493", "rand":"#CCCCCC"}
 	dark_cols = {"ddqn":"#008000", "ddpg":"#0000CD", "ppo":"#FF0000", "rand":"#999999"}
@@ -39,7 +40,8 @@ def graph_logs(env_name=env_name):
 		plt.xlabel("Step")
 		plt.ylabel("Total Reward")
 		plt.grid(linewidth=0.3, linestyle='-')
-		plt.show()
+		plt.savefig(f"graphs/{env_name}.png", dpi=1200, pad_inches=0.125)
+		if show: plt.show()
 	except NameError:
 		pass
 
