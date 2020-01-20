@@ -17,9 +17,9 @@ parser.add_argument("--model", type=str, default="ddpg", choices=["ddqn", "ddpg"
 parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
 args = parser.parse_args()
 
-gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
 gfb_envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
-env_name = gym_envs[5]
+env_name = gym_envs[-4]
 
 def make_env(env_name=env_name, log=False):
 	if env_name in gym_envs: return gym.make(env_name)
@@ -57,7 +57,7 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 	num_envs = len(ports) if type(ports) == list else min(ports, 64)
 	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
 	agent = AsyncAgent(envs.state_size, envs.action_size, num_envs, model)
-	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.stack.state_size, action_size=envs.action_size)
+	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.stack.state_size, action_size=envs.action_size, action_space=envs.env.action_space)
 	states = envs.reset()
 	total_rewards = []
 	for s in range(steps):

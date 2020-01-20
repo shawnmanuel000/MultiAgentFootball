@@ -4,11 +4,7 @@ import torch
 import random
 import numpy as np
 from models.rand import RandomAgent, PrioritizedReplayBuffer, ReplayBuffer
-from utils.network import PTQNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
-
-EPS_MIN = 0.020              	# The lower limit proportion of random to greedy actions to take
-EPS_DECAY = 0.98             	# The rate at which eps decays from EPS_MAX to EPS_MIN
-REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+from utils.network import PTQNetwork, PTACAgent, LEARN_RATE, NUM_STEPS, EPS_MIN, EPS_DECAY, REPLAY_BATCH_SIZE
 
 class DDQNetwork(PTQNetwork):
 	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None): 
