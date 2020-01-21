@@ -1,7 +1,7 @@
 import gym
 import argparse
 import numpy as np
-# import gfootball.env as ggym
+import gfootball.env as ggym
 from collections import deque
 from models.ppo import PPOAgent
 from models.ddqn import DDQNAgent
@@ -18,14 +18,14 @@ parser.add_argument("--steps", type=int, default=100000, help="Number of steps t
 args = parser.parse_args()
 
 gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
-gfb_envs = ["11_vs_11_stochastic", "academy_empty_goal_close"]
-env_name = gym_envs[-4]
+gfb_envs = ["academy_empty_goal_close", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
+env_name = gfb_envs[2]
 
 def make_env(env_name=env_name, log=False):
 	if env_name in gym_envs: return gym.make(env_name)
 	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
 	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
-	env.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
+	env.unwrapped.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
 	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
 	return env
 
@@ -53,7 +53,7 @@ class AsyncAgent(RandomAgent):
 	def save_model(self, dirname="pytorch", name="best"):
 		if hasattr(self.agent, "network"): self.agent.network.save_model(dirname, name)
 
-def run(model, steps=10000, ports=16, eval_at=1000):
+def run(model, steps=10000, ports=16, eval_at=1000, checkpoint=False):
 	num_envs = len(ports) if type(ports) == list else min(ports, 64)
 	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
 	agent = AsyncAgent(envs.state_size, envs.action_size, num_envs, model)
@@ -70,7 +70,7 @@ def run(model, steps=10000, ports=16, eval_at=1000):
 			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
 			test_reward = np.mean(rollouts) - np.std(rollouts)
 			total_rewards.append(test_reward)
-			agent.save_model(env_name, "checkpoint")
+			if checkpoint: agent.save_model(env_name, "checkpoint")
 			if env_name in gfb_envs and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
 			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
 

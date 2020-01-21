@@ -5,7 +5,7 @@ import matplotlib.pylab as plt
 from collections import deque
 
 gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
-gfb_envs = ["academy_empty_goal_close", "11_vs_11_stochastic"]
+gfb_envs = ["academy_empty_goal_close", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
 env_name = gym_envs[2]
 
 def read_log(path):
@@ -25,6 +25,7 @@ def read_log(path):
 
 def graph_logs(env_name=env_name, show=False):
 	plt.figure()
+	folder = "OpenAI" if env_name in gym_envs else "Football"
 	models = ["ppo", "ddpg", "ddqn", "rand"]
 	light_cols = {"ddqn":"#ADFF2F", "ddpg":"#00BFFF", "ppo":"#FF1493", "rand":"#CCCCCC"}
 	dark_cols = {"ddqn":"#008000", "ddpg":"#0000CD", "ppo":"#FF0000", "rand":"#999999"}
@@ -40,13 +41,15 @@ def graph_logs(env_name=env_name, show=False):
 		plt.xlabel("Step")
 		plt.ylabel("Total Reward")
 		plt.grid(linewidth=0.3, linestyle='-')
-		plt.savefig(f"graphs/{env_name}.png", dpi=1200, pad_inches=0.125)
+		os.makedirs(f"graphs/{folder}/", exist_ok=True)
+		print(f"Saving: graphs/{folder}/{env_name}.png")
+		plt.savefig(f"graphs/{folder}/{env_name}.png", dpi=1200, pad_inches=0.125)
 		if show: plt.show()
 	except NameError:
 		pass
 
 def main():
-	for env_name in gym_envs: 
+	for env_name in [*gfb_envs]: 
 		graph_logs(env_name)
 
 main()
