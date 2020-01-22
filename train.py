@@ -18,8 +18,8 @@ parser.add_argument("--steps", type=int, default=100000, help="Number of steps t
 args = parser.parse_args()
 
 gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
-gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
-env_name = gfb_envs[2]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
+env_name = gfb_envs[5]
 
 def make_env(env_name=env_name, log=False):
 	if env_name in gym_envs: return gym.make(env_name)

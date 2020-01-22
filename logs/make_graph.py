@@ -5,7 +5,7 @@ import matplotlib.pylab as plt
 from collections import deque
 
 gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
-gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
 env_name = gym_envs[2]
 
 def read_log(path):
