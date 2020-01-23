@@ -13,11 +13,11 @@ Then install the packages for the repository in the root directory by running
 ## Folder structure
 
 This repository is organized into 5 folders:
-football - Contains the source code for the Google Football environment
-logs - Contains lists of rewards vs step counts for training different RL models with visual plots in logs/graphs
-models - Python classes for each RL model (Eg. DDPG, DDQN, PPO)
-saved_models - PyTorch checkpoints for each model for different environments
-utils - Other Python classes and helper code
+* football - Contains the source code for the Google Football environment
+* logs - Contains lists of rewards vs step counts for training different RL * models with visual plots in logs/graphs
+* models - Python classes for each RL model (Eg. DDPG, DDQN, PPO)
+* saved_models - PyTorch checkpoints for each model for different environments
+* utils - Other Python classes and helper code
 
 ## Training
 
