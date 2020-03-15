@@ -1,0 +1,587 @@
+Model: <class 'models.rand.RandomAgent'>, Dir: 5_vs_5
+num_envs: 16,
+state_size: [(1, 115), (1, 115), (1, 115), (1, 115), (1, 115), (1, 115), (1, 115), (1, 115), (1, 115), (1, 115)],
+action_size: [[1, 19], [1, 19], [1, 19], [1, 19], [1, 19], [1, 19], [1, 19], [1, 19], [1, 19], [1, 19]],
+action_space: [MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19])],
+envs: <class 'utils.envs.EnvManager'>,
+reward_shape: False,
+icm: False,
+
+import gym
+import math
+import torch
+import random
+import numpy as np
+import scipy.special as sps
+from collections import deque
+from operator import itemgetter
+
+class Noise():
+	def __init__(self, size):
+		self.size = size
+
+	def reset(self):
+		pass
+
+	def sample(self, shape=[], scale=1):
+		return scale * np.random.randn(*shape, *self.size)
+
+class OUNoise(Noise):
+	def __init__(self, size, scale=0.1, mu=0, theta=0.15, sigma=0.2):
+		self.size = size
+		self.scale = scale
+		self.mu = mu
+		self.theta = theta
+		self.sigma = sigma
+		self.state = np.ones(*self.size) * self.mu
+		self.reset()
+
+	def reset(self, shape=[]):
+		self.state = np.ones(*shape, *self.size) * self.mu
+
+	def sample(self, shape=[], scale=1):
+		delta = self.sigma * np.random.randn(*self.state.shape)
+		if self.state.shape != delta.shape: self.reset(shape)
+		x = self.state
+		dx = self.theta * (self.mu - x) + delta
+		self.state = x + dx
+		return self.state * self.scale
+
+class BrownianNoise(Noise):
+	def __init__(self, size, dt=0.2):
+		self.size = size
+		self.dt = dt
+		self.reset()
+
+	def reset(self):
+		self.action = np.clip(np.random.randn(*self.size), -1, 1)
+		self.daction_dt = np.random.randn(*self.size)
+
+	def sample(self, shape=[], scale=1):
+		self.daction_dt = np.random.randn(*shape, *self.size)
+		self.action = np.zeros_like(self.daction_dt) if self.action.shape != self.daction_dt.shape else self.action
+		self.action = np.clip(self.action + math.sqrt(self.dt) * self.daction_dt, -1, 1)
+		return self.action * scale
+
+class RandomAgent():
+	def __init__(self, state_size, action_size, eps=1.0, **kwargs):
+		self.noise_process = BrownianNoise(action_size) if type(action_size[0]) in [int, np.int32] else [Noise(a_size) for a_size in action_size]
+		self.action_size = action_size
+		self.state_size = state_size
+		self.eps = eps
+
+	def get_action(self, state, eps=None, sample=True):
+		if type(self.state_size[0]) in [int, np.int32] and type(self.action_size[0]) in [int, np.int32]:
+			return self.noise_process.sample(state.shape[:-len(self.state_size)])
+		return [p.sample(s.shape[:-len(s_size)]) for p,s,s_size in zip(self.noise_process, state, self.state_size)]
+
+	def get_env_action(self, env, state=None, eps=None, sample=True):
+		action = self.get_action(state, eps, sample)
+		env_action = self.to_env_action(env.action_space, action)
+		return env_action, action
+
+	@staticmethod
+	def to_env_action(action_space, action):
+		if type(action_space) == list: return [RandomAgent.to_env_action(a_space, a) for a_space,a in zip(action_space, action)]
+		if type(action_space) in [gym.spaces.Discrete, gym.spaces.MultiDiscrete]: return np.argmax(action, -1)
+		return action_space.low + np.multiply((1+action)/2, action_space.high - action_space.low)
+
+	def train(self, state, action, next_state, reward, done):
+		if np.any(done[0]): self.noise_process.reset() if type(self.noise_process) != list else [p.reset() for p in self.noise_process]
+
+	def get_stats(self):
+		return {"eps": self.eps}
+
+class ReplayBuffer():
+	def __init__(self, maxlen=None):
+		self.buffer = deque(maxlen=maxlen)
+		
+	def add(self, experience):
+		self.buffer.append(experience)
+		return self
+
+	def extend(self, experiences, shuffle=False):
+		if shuffle: random.shuffle(experiences)
+		for exp in experiences:
+			self.add(exp)
+		return self
+
+	def clear(self):
+		self.buffer.clear()
+		self.i_batch = 0
+		return self
+		
+	def sample(self, batch_size, dtype=np.array, weights=None):
+		sample_size = min(len(self.buffer), batch_size)
+		sample_indices = random.choices(range(len(self.buffer)), k=sample_size, weights=weights)
+		samples = itemgetter(*sample_indices)(self.buffer)
+		sample_arrays = samples if dtype is None else map(dtype, zip(*samples))
+		return sample_arrays, sample_indices, torch.Tensor([1])
+
+	def next_batch(self, batch_size=1, dtype=np.array):
+		if not hasattr(self, "i_batch"): self.i_batch = 0
+		sample_indices = [i%len(self.buffer) for i in range(self.i_batch, self.i_batch+batch_size)]
+		samples = itemgetter(*sample_indices)(self.buffer)
+		self.i_batch = (self.i_batch+batch_size) % len(self.buffer)
+		return map(dtype, zip(*samples))
+
+	def update_priorities(self, indices, errors, offset=0.1):
+		pass
+
+	def reset_priorities(self):
+		pass
+
+	def __len__(self):
+		return len(self.buffer)
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+	def __init__(self, maxlen=None):
+		super().__init__(maxlen)
+		self.priorities = deque(maxlen=maxlen)
+		
+	def add(self, experience):
+		super().add(experience)
+		self.priorities.append(max(self.priorities, default=1))
+		return self
+
+	def clear(self):
+		super().clear()
+		self.priorities.clear()
+		return self
+		
+	def get_probabilities(self, priority_scale):
+		scaled_priorities = np.array(self.priorities) ** priority_scale
+		sample_probabilities = scaled_priorities / sum(scaled_priorities)
+		return sample_probabilities
+	
+	def get_importance(self, probabilities):
+		importance = 1/len(self.buffer) * 1/probabilities
+		importance_normalized = importance / max(importance)
+		return importance_normalized[:,np.newaxis]
+		
+	def sample(self, batch_size, dtype=np.array, priority_scale=0.5):
+		sample_probs = self.get_probabilities(priority_scale)
+		samples, sample_indices, _ = super().sample(batch_size, None, sample_probs)
+		importance = self.get_importance(sample_probs[sample_indices])
+		return map(dtype, zip(*samples)), sample_indices, torch.Tensor(importance)
+						
+	def update_priorities(self, indices, errors, offset=0.1):
+		for i,e in zip(indices, errors):
+			self.priorities[i] = abs(e) + offset
+
+	def reset_priorities(self):
+		for i in range(len(self.priorities)):
+			self.priorities[i] = 1
+
+class MultiagentReplayBuffer():
+	def __init__(self, max_steps, obs_dims, ac_dims, time=None):
+		self.num_agents = len(obs_dims)
+		self.max_steps = max_steps
+		self.obs_buffs = []
+		self.ac_buffs = []
+		self.rew_buffs = []
+		self.next_obs_buffs = []
+		self.done_buffs = []
+		time_dim = [] if time is None else [time]
+		for odim, adim in zip(obs_dims, ac_dims):
+			self.obs_buffs.append(np.zeros((max_steps, *time_dim, *odim)))
+			self.ac_buffs.append(np.zeros((max_steps, *time_dim, *adim)))
+			self.rew_buffs.append(np.zeros((max_steps, *time_dim)))
+			self.next_obs_buffs.append(np.zeros((max_steps, *time_dim, *odim)))
+			self.done_buffs.append(np.zeros((max_steps, *time_dim)))
+		self.filled_i = 0  # index of first empty location in buffer (last index when full)
+		self.curr_i = 0  # current index to write to (ovewrite oldest data)
+
+	def __len__(self):
+		return self.filled_i
+
+	def add(self, states, actions, next_states, rewards, dones):
+		nentries = states[0].shape[0]  # handle multiple parallel environments
+		if self.curr_i + nentries > self.max_steps:
+			rollover = self.max_steps - self.curr_i # num of indices to roll over
+			for agent_i in range(self.num_agents):
+				self.obs_buffs[agent_i] = np.roll(self.obs_buffs[agent_i],rollover, axis=0)
+				self.ac_buffs[agent_i] = np.roll(self.ac_buffs[agent_i],rollover, axis=0)
+				self.rew_buffs[agent_i] = np.roll(self.rew_buffs[agent_i],rollover)
+				self.next_obs_buffs[agent_i] = np.roll(self.next_obs_buffs[agent_i], rollover, axis=0)
+				self.done_buffs[agent_i] = np.roll(self.done_buffs[agent_i],rollover)
+			self.curr_i = 0
+			self.filled_i = self.max_steps
+		for agent_i in range(self.num_agents):
+			self.obs_buffs[agent_i][self.curr_i:self.curr_i + nentries] = states[agent_i]
+			self.ac_buffs[agent_i][self.curr_i:self.curr_i + nentries] = actions[agent_i]
+			self.next_obs_buffs[agent_i][self.curr_i:self.curr_i + nentries] = next_states[agent_i]
+			self.rew_buffs[agent_i][self.curr_i:self.curr_i + nentries] = rewards[agent_i]
+			self.done_buffs[agent_i][self.curr_i:self.curr_i + nentries] = dones[agent_i]
+		self.curr_i += nentries
+		if self.filled_i < self.max_steps:
+			self.filled_i += nentries
+		if self.curr_i == self.max_steps:
+			self.curr_i = 0
+
+	def sample(self, N, device, norm_rews=False):
+		inds = np.random.choice(np.arange(self.filled_i), size=N,replace=False)
+		cast = lambda x: torch.autograd.Variable(torch.Tensor(x), requires_grad=False).to(device)
+		return ([cast(self.obs_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.ac_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.next_obs_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.rew_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.done_buffs[i][inds]) for i in range(self.num_agents)])
+
+class MultiagentReplayBuffer2():
+	def __init__(self, max_steps, obs_dims, ac_dims, time=None):
+		self.num_agents = len(obs_dims)
+		self.max_steps = max_steps
+		self.obs_buffs = []
+		self.act_buffs = []
+		self.lps_buffs = []
+		self.tgt_buffs = []
+		self.adv_buffs = []
+		time_dim = [] if time is None else [time]
+		for odim, adim in zip(obs_dims, ac_dims):
+			self.obs_buffs.append(np.zeros((max_steps, *time_dim, *odim)))
+			self.act_buffs.append(np.zeros((max_steps, *time_dim, *adim)))
+			self.lps_buffs.append(np.zeros((max_steps, *time_dim, 1)))
+			self.tgt_buffs.append(np.zeros((max_steps, *time_dim, 1)))
+			self.adv_buffs.append(np.zeros((max_steps, *time_dim, 1)))
+		self.filled_i = 0  # index of first empty location in buffer (last index when full)
+		self.curr_i = 0  # current index to write to (ovewrite oldest data)
+
+	def __len__(self):
+		return self.filled_i
+
+	def clear(self):
+		self.filled_i = 0  # index of first empty location in buffer (last index when full)
+		self.curr_i = 0  # current index to write to (ovewrite oldest data)
+
+	def add(self, states, actions, log_probs, targets, advantages):
+		nentries = states[0].shape[0]  # handle multiple parallel environments
+		if self.curr_i + nentries > self.max_steps:
+			rollover = self.max_steps - self.curr_i # num of indices to roll over
+			for agent_i in range(self.num_agents):
+				self.obs_buffs[agent_i] = np.roll(self.obs_buffs[agent_i],rollover, axis=0)
+				self.act_buffs[agent_i] = np.roll(self.act_buffs[agent_i],rollover, axis=0)
+				self.lps_buffs[agent_i] = np.roll(self.lps_buffs[agent_i],rollover)
+				self.tgt_buffs[agent_i] = np.roll(self.tgt_buffs[agent_i],rollover, axis=0)
+				self.adv_buffs[agent_i] = np.roll(self.adv_buffs[agent_i],rollover)
+			self.curr_i = 0
+			self.filled_i = self.max_steps
+		for agent_i in range(self.num_agents):
+			self.obs_buffs[agent_i][self.curr_i:self.curr_i + nentries] = states[agent_i]
+			self.act_buffs[agent_i][self.curr_i:self.curr_i + nentries] = actions[agent_i]
+			self.lps_buffs[agent_i][self.curr_i:self.curr_i + nentries] = log_probs[agent_i]
+			self.tgt_buffs[agent_i][self.curr_i:self.curr_i + nentries] = targets[agent_i]
+			self.adv_buffs[agent_i][self.curr_i:self.curr_i + nentries] = advantages[agent_i]
+		self.curr_i += nentries
+		if self.filled_i < self.max_steps:
+			self.filled_i += nentries
+		if self.curr_i == self.max_steps:
+			self.curr_i = 0
+
+	def sample(self, N, device, norm_rews=False):
+		inds = np.random.choice(np.arange(self.filled_i), size=N, replace=False)
+		cast = lambda x: torch.autograd.Variable(torch.Tensor(x), requires_grad=False).to(device)
+		return ([cast(self.obs_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.act_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.lps_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.tgt_buffs[i][inds]) for i in range(self.num_agents)],
+				[cast(self.adv_buffs[i][inds]) for i in range(self.num_agents)])
+				
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0003           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 256				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 512				# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.998			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.001               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 1000000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.sac import SACAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-3]
+# env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False, reward_shape=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward: [(ballr(o[0,88], o[0,89]) + o[0,95]-o[0,96] + 2*r)/4 for o,r in zip(obs,reward)]
+	return FootballTeamEnv(ggym, env_name, reward_fn if reward_shape else None)
+
+def run(model, steps=10000, ports=16, env_name=env_name, trial_at=10000, save_at=10, checkpoint=True, save_best=False, log=True, render=False, reward_shape=False, icm=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name, reward_shape=reward_shape), ports)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=icm) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), reward_shape=reward_shape, icm=icm)
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})", agent.get_stats())
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}", agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {np.mean([rollout(envs.env, agent, eps=0.0, render=True) for _ in range(5)], axis=0)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[4], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="mappo", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--reward_shape", action="store_true", help="Whether to shape rewards for football")
+	parser.add_argument("--icm", action="store_true", help="Whether to use intrinsic motivation")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.trial:
+		trial(model=model, env_name=env_name, render=args.render)
+	elif args.selfport is not None or MPI_RANK>0 :
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	else:
+		run(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)
+
+
+Step:       0, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.146], Avg: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:   10000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.173], Avg: [ 0.094  0.094  0.094  0.094  0.094 -0.094 -0.094 -0.094 -0.094 -0.094] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step:   20000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [0.829], Avg: [-0.042 -0.042 -0.042 -0.042 -0.042  0.042  0.042  0.042  0.042  0.042] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step:   30000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.750], Avg: [ 0.016  0.016  0.016  0.016  0.016 -0.016 -0.016 -0.016 -0.016 -0.016] (1.0000) ({r_i: None, r_t: [-0.625 -0.625 -0.625 -0.625 -0.625], eps: 1.0})
+Step:   40000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.146], Avg: [ 0.025  0.025  0.025  0.025  0.025 -0.025 -0.025 -0.025 -0.025 -0.025] (1.0000) ({r_i: None, r_t: [-0.625 -0.625 -0.625 -0.625 -0.625], eps: 1.0})
+Step:   50000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.275], Avg: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step:   60000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [1.061], Avg: [ 0.018  0.018  0.018  0.018  0.018 -0.018 -0.018 -0.018 -0.018 -0.018] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step:   70000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.250], Avg: [ 0.008  0.008  0.008  0.008  0.008 -0.008 -0.008 -0.008 -0.008 -0.008] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:   80000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.061], Avg: [ 0.021  0.021  0.021  0.021  0.021 -0.021 -0.021 -0.021 -0.021 -0.021] (1.0000) ({r_i: None, r_t: [-0.562 -0.562 -0.562 -0.562 -0.562], eps: 1.0})
+Step:   90000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.866], Avg: [ 0.031  0.031  0.031  0.031  0.031 -0.031 -0.031 -0.031 -0.031 -0.031] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  100000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.901], Avg: [ 0.023  0.023  0.023  0.023  0.023 -0.023 -0.023 -0.023 -0.023 -0.023] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  110000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [0.935], Avg: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] (1.0000) ({r_i: None, r_t: [-0.562 -0.562 -0.562 -0.562 -0.562], eps: 1.0})
+Step:  120000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.225], Avg: [-0.029 -0.029 -0.029 -0.029 -0.029  0.029  0.029  0.029  0.029  0.029] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:  130000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [0.901], Avg: [-0.058 -0.058 -0.058 -0.058 -0.058  0.058  0.058  0.058  0.058  0.058] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step:  140000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.791], Avg: [-0.054 -0.054 -0.054 -0.054 -0.054  0.054  0.054  0.054  0.054  0.054] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  150000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.414], Avg: [-0.059 -0.059 -0.059 -0.059 -0.059  0.059  0.059  0.059  0.059  0.059] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  160000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.661], Avg: [-0.051 -0.051 -0.051 -0.051 -0.051  0.051  0.051  0.051  0.051  0.051] (1.0000) ({r_i: None, r_t: [ 0.688  0.688  0.688  0.688  0.688], eps: 1.0})
+Step:  170000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [1.500], Avg: [-0.049 -0.049 -0.049 -0.049 -0.049  0.049  0.049  0.049  0.049  0.049] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step:  180000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.000], Avg: [-0.039 -0.039 -0.039 -0.039 -0.039  0.039  0.039  0.039  0.039  0.039] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step:  190000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.829], Avg: [-0.034 -0.034 -0.034 -0.034 -0.034  0.034  0.034  0.034  0.034  0.034] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step:  200000, Reward: [ 0.500  0.500  0.500  0.500  0.500 -0.500 -0.500 -0.500 -0.500 -0.500] [1.275], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 1.312  1.312  1.312  1.312  1.312], eps: 1.0})
+Step:  210000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.173], Avg: [ 0.003  0.003  0.003  0.003  0.003 -0.003 -0.003 -0.003 -0.003 -0.003] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step:  220000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.866], Avg: [ 0.008  0.008  0.008  0.008  0.008 -0.008 -0.008 -0.008 -0.008 -0.008] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step:  230000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.968], Avg: [ 0.005  0.005  0.005  0.005  0.005 -0.005 -0.005 -0.005 -0.005 -0.005] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:  240000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.000], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step:  250000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [0.901], Avg: [-0.022 -0.022 -0.022 -0.022 -0.022  0.022  0.022  0.022  0.022  0.022] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step:  260000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [1.000], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step:  270000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.935], Avg: [-0.002 -0.002 -0.002 -0.002 -0.002  0.002  0.002  0.002  0.002  0.002] (1.0000) ({r_i: None, r_t: [-0.625 -0.625 -0.625 -0.625 -0.625], eps: 1.0})
+Step:  280000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.299], Avg: [ 0.004  0.004  0.004  0.004  0.004 -0.004 -0.004 -0.004 -0.004 -0.004] (1.0000) ({r_i: None, r_t: [ 0.750  0.750  0.750  0.750  0.750], eps: 1.0})
+Step:  290000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.935], Avg: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] (1.0000) ({r_i: None, r_t: [-0.688 -0.688 -0.688 -0.688 -0.688], eps: 1.0})
+Step:  300000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.031], Avg: [ 0.006  0.006  0.006  0.006  0.006 -0.006 -0.006 -0.006 -0.006 -0.006] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  310000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.707], Avg: [ 0.006  0.006  0.006  0.006  0.006 -0.006 -0.006 -0.006 -0.006 -0.006] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step:  320000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.061], Avg: [ 0.009  0.009  0.009  0.009  0.009 -0.009 -0.009 -0.009 -0.009 -0.009] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  330000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.901], Avg: [ 0.007  0.007  0.007  0.007  0.007 -0.007 -0.007 -0.007 -0.007 -0.007] (1.0000) ({r_i: None, r_t: [ 0.625  0.625  0.625  0.625  0.625], eps: 1.0})
+Step:  340000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.000], Avg: [ 0.004  0.004  0.004  0.004  0.004 -0.004 -0.004 -0.004 -0.004 -0.004] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step:  350000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.829], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:  360000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.901], Avg: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step:  370000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.199], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  380000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.090], Avg: [-0.003 -0.003 -0.003 -0.003 -0.003  0.003  0.003  0.003  0.003  0.003] (1.0000) ({r_i: None, r_t: [ 0.688  0.688  0.688  0.688  0.688], eps: 1.0})
+Step:  390000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.118], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step:  400000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.968], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step:  410000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [0.968], Avg: [-0.021 -0.021 -0.021 -0.021 -0.021  0.021  0.021  0.021  0.021  0.021] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  420000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.061], Avg: [-0.023 -0.023 -0.023 -0.023 -0.023  0.023  0.023  0.023  0.023  0.023] (1.0000) ({r_i: None, r_t: [-0.688 -0.688 -0.688 -0.688 -0.688], eps: 1.0})
+Step:  430000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [0.935], Avg: [-0.028 -0.028 -0.028 -0.028 -0.028  0.028  0.028  0.028  0.028  0.028] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step:  440000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.299], Avg: [-0.035 -0.035 -0.035 -0.035 -0.035  0.035  0.035  0.035  0.035  0.035] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  450000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.707], Avg: [-0.037 -0.037 -0.037 -0.037 -0.037  0.037  0.037  0.037  0.037  0.037] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step:  460000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.935], Avg: [-0.033 -0.033 -0.033 -0.033 -0.033  0.033  0.033  0.033  0.033  0.033] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  470000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.061], Avg: [-0.030 -0.030 -0.030 -0.030 -0.030  0.030  0.030  0.030  0.030  0.030] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step:  480000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.090], Avg: [-0.031 -0.031 -0.031 -0.031 -0.031  0.031  0.031  0.031  0.031  0.031] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  490000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [1.199], Avg: [-0.039 -0.039 -0.039 -0.039 -0.039  0.039  0.039  0.039  0.039  0.039] (1.0000) ({r_i: None, r_t: [-0.438 -0.438 -0.438 -0.438 -0.438], eps: 1.0})
+Step:  500000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.090], Avg: [-0.042 -0.042 -0.042 -0.042 -0.042  0.042  0.042  0.042  0.042  0.042] (1.0000) ({r_i: None, r_t: [ 0.375  0.375  0.375  0.375  0.375], eps: 1.0})
+Step:  510000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [0.935], Avg: [-0.034 -0.034 -0.034 -0.034 -0.034  0.034  0.034  0.034  0.034  0.034] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  520000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.250], Avg: [-0.032 -0.032 -0.032 -0.032 -0.032  0.032  0.032  0.032  0.032  0.032] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step:  530000, Reward: [ 0.688  0.688  0.688  0.688  0.688 -0.688 -0.688 -0.688 -0.688 -0.688] [1.146], Avg: [-0.019 -0.019 -0.019 -0.019 -0.019  0.019  0.019  0.019  0.019  0.019] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  540000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.031], Avg: [-0.015 -0.015 -0.015 -0.015 -0.015  0.015  0.015  0.015  0.015  0.015] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  550000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.225], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  560000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.225], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  570000, Reward: [-0.500 -0.500 -0.500 -0.500 -0.500  0.500  0.500  0.500  0.500  0.500] [0.866], Avg: [-0.018 -0.018 -0.018 -0.018 -0.018  0.018  0.018  0.018  0.018  0.018] (1.0000) ({r_i: None, r_t: [ 0.688  0.688  0.688  0.688  0.688], eps: 1.0})
+Step:  580000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.173], Avg: [-0.020 -0.020 -0.020 -0.020 -0.020  0.020  0.020  0.020  0.020  0.020] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step:  590000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.199], Avg: [-0.023 -0.023 -0.023 -0.023 -0.023  0.023  0.023  0.023  0.023  0.023] (1.0000) ({r_i: None, r_t: [ 0.312  0.312  0.312  0.312  0.312], eps: 1.0})
+Step:  600000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.392], Avg: [-0.019 -0.019 -0.019 -0.019 -0.019  0.019  0.019  0.019  0.019  0.019] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step:  610000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [1.000], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.750 -0.750 -0.750 -0.750 -0.750], eps: 1.0})
+Step:  620000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.750], Avg: [-0.016 -0.016 -0.016 -0.016 -0.016  0.016  0.016  0.016  0.016  0.016] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step:  630000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.090], Avg: [-0.015 -0.015 -0.015 -0.015 -0.015  0.015  0.015  0.015  0.015  0.015] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step:  640000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.829], Avg: [-0.017 -0.017 -0.017 -0.017 -0.017  0.017  0.017  0.017  0.017  0.017] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step:  650000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.225], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step:  660000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.866], Avg: [-0.015 -0.015 -0.015 -0.015 -0.015  0.015  0.015  0.015  0.015  0.015] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:  670000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.146], Avg: [-0.014 -0.014 -0.014 -0.014 -0.014  0.014  0.014  0.014  0.014  0.014] (1.0000) ({r_i: None, r_t: [-1.000 -1.000 -1.000 -1.000 -1.000], eps: 1.0})
+Step:  680000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.829], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step:  690000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.000], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [-1.188 -1.188 -1.188 -1.188 -1.188], eps: 1.0})
+Step:  700000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.118], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step:  710000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.791], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [-0.688 -0.688 -0.688 -0.688 -0.688], eps: 1.0})
+Step:  720000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.031], Avg: [-0.004 -0.004 -0.004 -0.004 -0.004  0.004  0.004  0.004  0.004  0.004] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step:  730000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.225], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  740000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.791], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  750000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [0.612], Avg: [-0.014 -0.014 -0.014 -0.014 -0.014  0.014  0.014  0.014  0.014  0.014] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step:  760000, Reward: [ 0.875  0.875  0.875  0.875  0.875 -0.875 -0.875 -0.875 -0.875 -0.875] [1.323], Avg: [-0.002 -0.002 -0.002 -0.002 -0.002  0.002  0.002  0.002  0.002  0.002] (1.0000) ({r_i: None, r_t: [ 0.312  0.312  0.312  0.312  0.312], eps: 1.0})
+Step:  770000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.061], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  780000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.901], Avg: [ 0.003  0.003  0.003  0.003  0.003 -0.003 -0.003 -0.003 -0.003 -0.003] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step:  790000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.031], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step:  800000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [0.935], Avg: [-0.004 -0.004 -0.004 -0.004 -0.004  0.004  0.004  0.004  0.004  0.004] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step:  810000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.299], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [ 0.312  0.312  0.312  0.312  0.312], eps: 1.0})
+Step:  820000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [0.866], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  830000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.829], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  840000, Reward: [ 0.625  0.625  0.625  0.625  0.625 -0.625 -0.625 -0.625 -0.625 -0.625] [1.275], Avg: [-0.004 -0.004 -0.004 -0.004 -0.004  0.004  0.004  0.004  0.004  0.004] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  850000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.750], Avg: [-0.004 -0.004 -0.004 -0.004 -0.004  0.004  0.004  0.004  0.004  0.004] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step:  860000, Reward: [-0.500 -0.500 -0.500 -0.500 -0.500  0.500  0.500  0.500  0.500  0.500] [1.000], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  870000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [1.061], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.625 -0.625 -0.625 -0.625 -0.625], eps: 1.0})
+Step:  880000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.829], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step:  890000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.031], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step:  900000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [1.225], Avg: [-0.014 -0.014 -0.014 -0.014 -0.014  0.014  0.014  0.014  0.014  0.014] (1.0000) ({r_i: None, r_t: [-0.438 -0.438 -0.438 -0.438 -0.438], eps: 1.0})
+Step:  910000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.968], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step:  920000, Reward: [-0.562 -0.562 -0.562 -0.562 -0.562  0.562  0.562  0.562  0.562  0.562] [1.031], Avg: [-0.017 -0.017 -0.017 -0.017 -0.017  0.017  0.017  0.017  0.017  0.017] (1.0000) ({r_i: None, r_t: [-0.750 -0.750 -0.750 -0.750 -0.750], eps: 1.0})
+Step:  930000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.500], Avg: [-0.017 -0.017 -0.017 -0.017 -0.017  0.017  0.017  0.017  0.017  0.017] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step:  940000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.750], Avg: [-0.018 -0.018 -0.018 -0.018 -0.018  0.018  0.018  0.018  0.018  0.018] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step:  950000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.829], Avg: [-0.018 -0.018 -0.018 -0.018 -0.018  0.018  0.018  0.018  0.018  0.018] (1.0000) ({r_i: None, r_t: [ 1.000  1.000  1.000  1.000  1.000], eps: 1.0})
+Step:  960000, Reward: [ 0.500  0.500  0.500  0.500  0.500 -0.500 -0.500 -0.500 -0.500 -0.500] [1.000], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  970000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [1.090], Avg: [-0.017 -0.017 -0.017 -0.017 -0.017  0.017  0.017  0.017  0.017  0.017] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step:  980000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.090], Avg: [-0.015 -0.015 -0.015 -0.015 -0.015  0.015  0.015  0.015  0.015  0.015] (1.0000) ({r_i: None, r_t: [-1.438 -1.438 -1.438 -1.438 -1.438], eps: 1.0})
+Step:  990000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.707], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1000000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.829], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1010000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.146], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [ 0.375  0.375  0.375  0.375  0.375], eps: 1.0})
+Step: 1020000, Reward: [-0.562 -0.562 -0.562 -0.562 -0.562  0.562  0.562  0.562  0.562  0.562] [1.146], Avg: [-0.018 -0.018 -0.018 -0.018 -0.018  0.018  0.018  0.018  0.018  0.018] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1030000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.090], Avg: [-0.019 -0.019 -0.019 -0.019 -0.019  0.019  0.019  0.019  0.019  0.019] (1.0000) ({r_i: None, r_t: [-0.688 -0.688 -0.688 -0.688 -0.688], eps: 1.0})
+Step: 1040000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.866], Avg: [-0.017 -0.017 -0.017 -0.017 -0.017  0.017  0.017  0.017  0.017  0.017] (1.0000) ({r_i: None, r_t: [-0.750 -0.750 -0.750 -0.750 -0.750], eps: 1.0})
+Step: 1050000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [1.225], Avg: [-0.019 -0.019 -0.019 -0.019 -0.019  0.019  0.019  0.019  0.019  0.019] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1060000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [1.323], Avg: [-0.019 -0.019 -0.019 -0.019 -0.019  0.019  0.019  0.019  0.019  0.019] (1.0000) ({r_i: None, r_t: [ 1.562  1.562  1.562  1.562  1.562], eps: 1.0})
+Step: 1070000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.275], Avg: [-0.022 -0.022 -0.022 -0.022 -0.022  0.022  0.022  0.022  0.022  0.022] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1080000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.935], Avg: [-0.023 -0.023 -0.023 -0.023 -0.023  0.023  0.023  0.023  0.023  0.023] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step: 1090000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.061], Avg: [-0.022 -0.022 -0.022 -0.022 -0.022  0.022  0.022  0.022  0.022  0.022] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step: 1100000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.901], Avg: [-0.021 -0.021 -0.021 -0.021 -0.021  0.021  0.021  0.021  0.021  0.021] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1110000, Reward: [-0.562 -0.562 -0.562 -0.562 -0.562  0.562  0.562  0.562  0.562  0.562] [1.146], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step: 1120000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.935], Avg: [-0.024 -0.024 -0.024 -0.024 -0.024  0.024  0.024  0.024  0.024  0.024] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1130000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [0.968], Avg: [-0.028 -0.028 -0.028 -0.028 -0.028  0.028  0.028  0.028  0.028  0.028] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1140000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.791], Avg: [-0.027 -0.027 -0.027 -0.027 -0.027  0.027  0.027  0.027  0.027  0.027] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1150000, Reward: [ 0.438  0.438  0.438  0.438  0.438 -0.438 -0.438 -0.438 -0.438 -0.438] [1.090], Avg: [-0.023 -0.023 -0.023 -0.023 -0.023  0.023  0.023  0.023  0.023  0.023] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1160000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.000], Avg: [-0.024 -0.024 -0.024 -0.024 -0.024  0.024  0.024  0.024  0.024  0.024] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1170000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.031], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [-0.562 -0.562 -0.562 -0.562 -0.562], eps: 1.0})
+Step: 1180000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.935], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [-0.750 -0.750 -0.750 -0.750 -0.750], eps: 1.0})
+Step: 1190000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.750], Avg: [-0.027 -0.027 -0.027 -0.027 -0.027  0.027  0.027  0.027  0.027  0.027] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1200000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.118], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1210000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [0.968], Avg: [-0.028 -0.028 -0.028 -0.028 -0.028  0.028  0.028  0.028  0.028  0.028] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step: 1220000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.000], Avg: [-0.027 -0.027 -0.027 -0.027 -0.027  0.027  0.027  0.027  0.027  0.027] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step: 1230000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.901], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1240000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [0.866], Avg: [-0.029 -0.029 -0.029 -0.029 -0.029  0.029  0.029  0.029  0.029  0.029] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1250000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.392], Avg: [-0.031 -0.031 -0.031 -0.031 -0.031  0.031  0.031  0.031  0.031  0.031] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step: 1260000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.829], Avg: [-0.031 -0.031 -0.031 -0.031 -0.031  0.031  0.031  0.031  0.031  0.031] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})
+Step: 1270000, Reward: [ 0.625  0.625  0.625  0.625  0.625 -0.625 -0.625 -0.625 -0.625 -0.625] [1.173], Avg: [-0.026 -0.026 -0.026 -0.026 -0.026  0.026  0.026  0.026  0.026  0.026] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step: 1280000, Reward: [ 0.750  0.750  0.750  0.750  0.750 -0.750 -0.750 -0.750 -0.750 -0.750] [1.118], Avg: [-0.020 -0.020 -0.020 -0.020 -0.020  0.020  0.020  0.020  0.020  0.020] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step: 1290000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.968], Avg: [-0.021 -0.021 -0.021 -0.021 -0.021  0.021  0.021  0.021  0.021  0.021] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step: 1300000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.901], Avg: [-0.020 -0.020 -0.020 -0.020 -0.020  0.020  0.020  0.020  0.020  0.020] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step: 1310000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.250], Avg: [-0.018 -0.018 -0.018 -0.018 -0.018  0.018  0.018  0.018  0.018  0.018] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1320000, Reward: [ 0.750  0.750  0.750  0.750  0.750 -0.750 -0.750 -0.750 -0.750 -0.750] [1.275], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step: 1330000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [1.458], Avg: [-0.014 -0.014 -0.014 -0.014 -0.014  0.014  0.014  0.014  0.014  0.014] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1340000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.968], Avg: [-0.014 -0.014 -0.014 -0.014 -0.014  0.014  0.014  0.014  0.014  0.014] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1350000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.612], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1360000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.968], Avg: [-0.013 -0.013 -0.013 -0.013 -0.013  0.013  0.013  0.013  0.013  0.013] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step: 1370000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.707], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1380000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.829], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1390000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.250], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.188 -0.188 -0.188 -0.188 -0.188], eps: 1.0})
+Step: 1400000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.061], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1410000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.146], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.750 -0.750 -0.750 -0.750 -0.750], eps: 1.0})
+Step: 1420000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.392], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [ 0.688  0.688  0.688  0.688  0.688], eps: 1.0})
+Step: 1430000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [1.275], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1440000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [0.968], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1450000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.661], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 1.000  1.000  1.000  1.000  1.000], eps: 1.0})
+Step: 1460000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.458], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1470000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.866], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step: 1480000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.935], Avg: [-0.006 -0.006 -0.006 -0.006 -0.006  0.006  0.006  0.006  0.006  0.006] (1.0000) ({r_i: None, r_t: [-0.938 -0.938 -0.938 -0.938 -0.938], eps: 1.0})
+Step: 1490000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.173], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [ 0.375  0.375  0.375  0.375  0.375], eps: 1.0})
+Step: 1500000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.250], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [-0.562 -0.562 -0.562 -0.562 -0.562], eps: 1.0})
+Step: 1510000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [0.707], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1520000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [1.118], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1530000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.791], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step: 1540000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.935], Avg: [-0.006 -0.006 -0.006 -0.006 -0.006  0.006  0.006  0.006  0.006  0.006] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step: 1550000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.968], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [ 1.375  1.375  1.375  1.375  1.375], eps: 1.0})
+Step: 1560000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.000], Avg: [-0.005 -0.005 -0.005 -0.005 -0.005  0.005  0.005  0.005  0.005  0.005] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step: 1570000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [1.275], Avg: [-0.007 -0.007 -0.007 -0.007 -0.007  0.007  0.007  0.007  0.007  0.007] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1580000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.436], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1590000, Reward: [ 0.312  0.312  0.312  0.312  0.312 -0.312 -0.312 -0.312 -0.312 -0.312] [1.146], Avg: [-0.006 -0.006 -0.006 -0.006 -0.006  0.006  0.006  0.006  0.006  0.006] (1.0000) ({r_i: None, r_t: [-0.062 -0.062 -0.062 -0.062 -0.062], eps: 1.0})
+Step: 1600000, Reward: [-0.625 -0.625 -0.625 -0.625 -0.625  0.625  0.625  0.625  0.625  0.625] [1.275], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.375 -0.375 -0.375 -0.375 -0.375], eps: 1.0})
+Step: 1610000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [0.968], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1620000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.323], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step: 1630000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [1.000], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.875 -0.875 -0.875 -0.875 -0.875], eps: 1.0})
+Step: 1640000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [0.935], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1650000, Reward: [-0.438 -0.438 -0.438 -0.438 -0.438  0.438  0.438  0.438  0.438  0.438] [1.031], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1660000, Reward: [ 0.312  0.312  0.312  0.312  0.312 -0.312 -0.312 -0.312 -0.312 -0.312] [0.750], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1670000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.173], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 1.500  1.500  1.500  1.500  1.500], eps: 1.0})
+Step: 1680000, Reward: [-0.312 -0.312 -0.312 -0.312 -0.312  0.312  0.312  0.312  0.312  0.312] [1.299], Avg: [-0.012 -0.012 -0.012 -0.012 -0.012  0.012  0.012  0.012  0.012  0.012] (1.0000) ({r_i: None, r_t: [-0.125 -0.125 -0.125 -0.125 -0.125], eps: 1.0})
+Step: 1690000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.968], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [ 0.688  0.688  0.688  0.688  0.688], eps: 1.0})
+Step: 1700000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.866], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.812  0.812  0.812  0.812  0.812], eps: 1.0})
+Step: 1710000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.090], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step: 1720000, Reward: [-0.125 -0.125 -0.125 -0.125 -0.125  0.125  0.125  0.125  0.125  0.125] [1.414], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.562 -0.562 -0.562 -0.562 -0.562], eps: 1.0})
+Step: 1730000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [1.173], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step: 1740000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [0.866], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step: 1750000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.000], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1760000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.791], Avg: [-0.010 -0.010 -0.010 -0.010 -0.010  0.010  0.010  0.010  0.010  0.010] (1.0000) ({r_i: None, r_t: [ 0.500  0.500  0.500  0.500  0.500], eps: 1.0})
+Step: 1770000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [1.090], Avg: [-0.011 -0.011 -0.011 -0.011 -0.011  0.011  0.011  0.011  0.011  0.011] (1.0000) ({r_i: None, r_t: [-0.312 -0.312 -0.312 -0.312 -0.312], eps: 1.0})
+Step: 1780000, Reward: [ 0.312  0.312  0.312  0.312  0.312 -0.312 -0.312 -0.312 -0.312 -0.312] [1.031], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 0.312  0.312  0.312  0.312  0.312], eps: 1.0})
+Step: 1790000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [0.750], Avg: [-0.008 -0.008 -0.008 -0.008 -0.008  0.008  0.008  0.008  0.008  0.008] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step: 1800000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.829], Avg: [-0.009 -0.009 -0.009 -0.009 -0.009  0.009  0.009  0.009  0.009  0.009] (1.0000) ({r_i: None, r_t: [ 0.188  0.188  0.188  0.188  0.188], eps: 1.0})
+Step: 1810000, Reward: [ 0.500  0.500  0.500  0.500  0.500 -0.500 -0.500 -0.500 -0.500 -0.500] [1.000], Avg: [-0.006 -0.006 -0.006 -0.006 -0.006  0.006  0.006  0.006  0.006  0.006] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step: 1820000, Reward: [ 0.688  0.688  0.688  0.688  0.688 -0.688 -0.688 -0.688 -0.688 -0.688] [1.199], Avg: [-0.002 -0.002 -0.002 -0.002 -0.002  0.002  0.002  0.002  0.002  0.002] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1830000, Reward: [ 0.250  0.250  0.250  0.250  0.250 -0.250 -0.250 -0.250 -0.250 -0.250] [1.414], Avg: [-0.001 -0.001 -0.001 -0.001 -0.001  0.001  0.001  0.001  0.001  0.001] (1.0000) ({r_i: None, r_t: [-0.500 -0.500 -0.500 -0.500 -0.500], eps: 1.0})
+Step: 1840000, Reward: [ 0.375  0.375  0.375  0.375  0.375 -0.375 -0.375 -0.375 -0.375 -0.375] [0.791], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1850000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.031], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [ 0.562  0.562  0.562  0.562  0.562], eps: 1.0})
+Step: 1860000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.661], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step: 1870000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.250], Avg: [ 0.003  0.003  0.003  0.003  0.003 -0.003 -0.003 -0.003 -0.003 -0.003] (1.0000) ({r_i: None, r_t: [ 0.438  0.438  0.438  0.438  0.438], eps: 1.0})
+Step: 1880000, Reward: [-0.375 -0.375 -0.375 -0.375 -0.375  0.375  0.375  0.375  0.375  0.375] [1.173], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 1.125  1.125  1.125  1.125  1.125], eps: 1.0})
+Step: 1890000, Reward: [ 0.062  0.062  0.062  0.062  0.062 -0.062 -0.062 -0.062 -0.062 -0.062] [1.199], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.062  0.062  0.062  0.062  0.062], eps: 1.0})
+Step: 1900000, Reward: [ 0.125  0.125  0.125  0.125  0.125 -0.125 -0.125 -0.125 -0.125 -0.125] [0.707], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [-0.250 -0.250 -0.250 -0.250 -0.250], eps: 1.0})
+Step: 1910000, Reward: [-0.062 -0.062 -0.062 -0.062 -0.062  0.062  0.062  0.062  0.062  0.062] [0.829], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1920000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [0.750], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.250  0.250  0.250  0.250  0.250], eps: 1.0})
+Step: 1930000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.031], Avg: [-0.000 -0.000 -0.000 -0.000 -0.000  0.000  0.000  0.000  0.000  0.000] (1.0000) ({r_i: None, r_t: [ 0.312  0.312  0.312  0.312  0.312], eps: 1.0})
+Step: 1940000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.090], Avg: [ 0.001  0.001  0.001  0.001  0.001 -0.001 -0.001 -0.001 -0.001 -0.001] (1.0000) ({r_i: None, r_t: [ 0.000  0.000  0.000  0.000  0.000], eps: 1.0})
+Step: 1950000, Reward: [-0.250 -0.250 -0.250 -0.250 -0.250  0.250  0.250  0.250  0.250  0.250] [0.866], Avg: [-0.001 -0.001 -0.001 -0.001 -0.001  0.001  0.001  0.001  0.001  0.001] (1.0000) ({r_i: None, r_t: [-0.438 -0.438 -0.438 -0.438 -0.438], eps: 1.0})
+Step: 1960000, Reward: [ 0.188  0.188  0.188  0.188  0.188 -0.188 -0.188 -0.188 -0.188 -0.188] [1.090], Avg: [ 0.000  0.000  0.000  0.000  0.000 -0.000 -0.000 -0.000 -0.000 -0.000] (1.0000) ({r_i: None, r_t: [-0.875 -0.875 -0.875 -0.875 -0.875], eps: 1.0})
+Step: 1970000, Reward: [ 0.312  0.312  0.312  0.312  0.312 -0.312 -0.312 -0.312 -0.312 -0.312] [1.146], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [-0.688 -0.688 -0.688 -0.688 -0.688], eps: 1.0})
+Step: 1980000, Reward: [ 0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000  0.000] [0.935], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [ 0.625  0.625  0.625  0.625  0.625], eps: 1.0})
+Step: 1990000, Reward: [ 0.312  0.312  0.312  0.312  0.312 -0.312 -0.312 -0.312 -0.312 -0.312] [1.392], Avg: [ 0.003  0.003  0.003  0.003  0.003 -0.003 -0.003 -0.003 -0.003 -0.003] (1.0000) ({r_i: None, r_t: [-1.125 -1.125 -1.125 -1.125 -1.125], eps: 1.0})
+Step: 2000000, Reward: [-0.188 -0.188 -0.188 -0.188 -0.188  0.188  0.188  0.188  0.188  0.188] [1.346], Avg: [ 0.002  0.002  0.002  0.002  0.002 -0.002 -0.002 -0.002 -0.002 -0.002] (1.0000) ({r_i: None, r_t: [ 0.125  0.125  0.125  0.125  0.125], eps: 1.0})

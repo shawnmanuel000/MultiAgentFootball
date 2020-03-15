@@ -1,0 +1,204 @@
+Model: <class 'multiagent.maddpg.MADDPGAgent'>, Dir: 3_vs_3_custom
+num_envs: 16, state_size: [(1, 115), (1, 115), (1, 115)], action_size: [[1, 19], [1, 19], [1, 19]], action_space: [MultiDiscrete([19]), MultiDiscrete([19]), MultiDiscrete([19])],
+
+import torch
+import random
+import numpy as np
+from models.rand import MultiagentReplayBuffer
+from models.ddpg import DDPGActor, DDPGCritic, DDPGNetwork
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, LEARN_RATE, DISCOUNT_RATE, EPS_MIN, EPS_DECAY, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, MAX_BUFFER_SIZE, TARGET_UPDATE_RATE, gsoftmax, one_hot
+
+LEARN_RATE = 0.001				# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001		# How frequently we want to copy the local network to the target network (for double DQNs)
+REPLAY_BATCH_SIZE = 1024		# How many experience tuples to sample from the buffer for each train step
+ENTROPY_WEIGHT = 0.001			# The weight for the entropy term of the Actor loss
+NUM_STEPS = 100					# The number of steps to collect experience in sequence for each GAE calculation
+
+class MADDPGActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, sample=True):
+		state = self.layer1(state).relu() 
+		state = self.layer2(state).relu() 
+		action_mu = self.action_mu(state)
+		return action_mu
+	
+class MADDPGCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1]+action_size[-1], INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.q_value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, action):
+		state = torch.cat([state, action], -1)
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		q_value = self.q_value(state)
+		return q_value
+
+class MADDPGNetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=False, load=None):
+		super().__init__(tau=tau, gpu=gpu)
+		self.state_size = state_size
+		self.action_size = action_size
+		self.critic = lambda s,a: MADDPGCritic([np.sum([np.prod(s) for s in self.state_size])], [np.sum([np.prod(a) for a in self.action_size])])
+		self.models = [DDPGNetwork(s_size, a_size, MADDPGActor, self.critic, lr=lr, gpu=gpu, load=load) for s_size,a_size in zip(self.state_size, self.action_size)]
+		if load: self.load_model(load)
+
+	def get_action_probs(self, state, use_target=False, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action = [gsoftmax(model.get_action(s, use_target, grad, numpy=False), hard=True) for s,model in zip(state, self.models)]
+			return [a.cpu().numpy() if numpy else a for a in action]
+
+	def optimize(self, states, actions, next_states, rewards, dones, gamma=DISCOUNT_RATE, e_weight=ENTROPY_WEIGHT):
+		for i, agent in enumerate(self.models):
+			next_actions = [one_hot(model.get_action(nobs, numpy=False)) for model, nobs in zip(self.models, next_states)]
+			next_states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(next_states, self.state_size)], dim=-1)
+			next_actions_joint = torch.cat([a.view(*a.size()[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(next_actions, self.action_size)], dim=-1)
+			next_value = agent.get_q_value(next_states_joint, next_actions_joint, use_target=True, numpy=False)
+			q_target = (rewards[i].view(-1, 1) + gamma * next_value * (1 - dones[i].view(-1, 1)))
+
+			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+			actions_joint = torch.cat([a.view(*a.size()[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(actions, self.action_size)], dim=-1)
+			q_value = agent.get_q_value(states_joint, actions_joint, grad=True, numpy=False)
+			critic_loss = (q_value - q_target.detach()).pow(2).mean()
+			agent.step(agent.critic_optimizer, critic_loss, param_norm=agent.critic_local.parameters())
+			agent.soft_copy(agent.critic_local, agent.critic_target)
+
+			actor_action = agent.get_action(states[i], grad=True, numpy=False)
+			action = [gsoftmax(actor_action, hard=True) if j==i else one_hot(model.get_action(ob, numpy=False)) for (j,model), ob in zip(enumerate(self.models), states)]
+			action_joint = torch.cat([a.view(*a.size()[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(action, self.action_size)], dim=-1)
+			actor_loss = -(agent.critic_local(states_joint, action_joint)-q_target).mean() + e_weight*actor_action.pow(2).mean() 
+			agent.step(agent.actor_optimizer, actor_loss, param_norm=agent.actor_local.parameters())
+			agent.soft_copy(agent.actor_local, agent.actor_target)
+
+	def save_model(self, dirname="pytorch", name="checkpoint"):
+		[PTACNetwork.save_model(model, "maddpg", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+	def load_model(self, dirname="pytorch", name="checkpoint"):
+		[PTACNetwork.load_model(model, "maddpg", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+class MADDPGAgent(PTACAgent):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, MADDPGNetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+		self.replay_buffer = MultiagentReplayBuffer(MAX_BUFFER_SIZE, state_size, action_size)
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		action = self.network.get_action_probs(self.to_tensor(state), sample=sample, numpy=numpy)
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.step = 0 if not hasattr(self, "step") else self.step + 1
+		self.replay_buffer.push(state, action, next_state, reward, done)
+		if (self.step % self.update_freq)==0 and len(self.replay_buffer) >= REPLAY_BATCH_SIZE:
+			states, actions, next_states, rewards, dones = self.replay_buffer.sample(REPLAY_BATCH_SIZE, to_gpu=False)
+			self.network.optimize(states, actions, next_states, rewards, dones, gamma=DISCOUNT_RATE)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 100					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.950             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-4]
+# env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False):
+	if env_name in gym_envs: return gym.make(env_name)
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	multiagent_args = {"number_of_left_players_agent_controls":3, "number_of_right_players_agent_controls":0} if env_name == "3_vs_3_custom" else {}
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=render, **multiagent_args)
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space}")
+	return FootballTeamEnv(env)
+
+def run(model, steps=10000, ports=16, env_name=env_name, eval_at=1000, checkpoint=True, save_best=False, log=True, render=True):
+	num_envs = len(ports) if type(ports) == list else min(ports, 64)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(lambda: make_env(env_name), ports)
+	agent = ParallelAgent(envs.state_size, envs.action_size, model, num_envs=num_envs, gpu=False, agent2=RandomAgent) 
+	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space)
+	states = envs.reset()
+	total_rewards = []
+	for s in range(steps):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if np.any(dones[0]):
+			rollouts = [rollout(envs.env, agent.reset(1), render=render) for _ in range(1)]
+			test_reward = np.mean(rollouts, axis=0) - np.std(rollouts, axis=0)
+			total_rewards.append(test_reward)
+			if checkpoint: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=0)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts, axis=0)} [{np.std(rollouts):.4f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.agent.eps:.3f})")
+			agent.reset(num_envs)
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = ParallelAgent(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}")
+	print(f"Reward: {rollout(envs.env, agent, eps=0.02, render=True)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="maddpg", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.trial:
+		trial(model, env_name=env_name, render=args.render)
+	elif args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		run(model, args.steps, args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render)
+
+Step: 499, Reward: [0. 0. 0.] [0.0000], Avg: [0. 0. 0.] (1.000)
+Step: 999, Reward: [0. 0. 0.] [0.0000], Avg: [0. 0. 0.] (1.000)

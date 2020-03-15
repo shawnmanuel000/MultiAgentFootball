@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-
-
 import gfootball_engine as libgame
 e_PlayerRole_GK = libgame.e_PlayerRole.e_PlayerRole_GK
 e_PlayerRole_CB = libgame.e_PlayerRole.e_PlayerRole_CB

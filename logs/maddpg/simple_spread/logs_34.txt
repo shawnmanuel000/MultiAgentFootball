@@ -1,0 +1,245 @@
+Model: <class 'multiagent.maddpg.MADDPGAgent'>, Dir: simple_spread
+num_envs: 1, state_size: [(1, 18), (1, 18), (1, 18)], action_size: [[1, 5], [1, 5], [1, 5]], action_space: [MultiDiscrete([5]), MultiDiscrete([5]), MultiDiscrete([5])],
+
+import torch
+import random
+import numpy as np
+from models.ddpg import DDPGActor, DDPGCritic, DDPGNetwork
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACAgent, LEARN_RATE, NUM_STEPS, EPS_MIN, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, gumbel_softmax, one_hot
+
+REPLAY_BATCH_SIZE = 8
+ENTROPY_WEIGHT = 0.001			# The weight for the entropy term of the Actor loss
+EPS_DECAY = 0.995             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+INPUT_LAYER = 64
+ACTOR_HIDDEN = 64
+CRITIC_HIDDEN = 64
+LEARN_RATE = 0.01
+TARGET_UPDATE_RATE = 0.01
+
+class MADDPGActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		# self.action_sig = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		self.norm = torch.nn.BatchNorm1d(state_size[-1])
+		self.norm.weight.data.fill_(1)
+		self.norm.bias.data.fill_(0)
+
+	def forward(self, state, sample=True):
+		out_dims = state.size()[:-1]
+		state = state.view(int(np.prod(out_dims)), -1)
+		state = self.norm(state) if state.shape[0]>1 else state
+		state = self.layer1(state).relu() 
+		state = self.layer2(state).relu() 
+		action_mu = self.action_mu(state)
+		# action_sig = self.action_sig(state).tanh().exp()
+		# epsilon = torch.randn_like(action_sig)
+		# action = action_mu + epsilon.mul(action_sig) if sample else action_mu
+		action = gumbel_softmax(action_mu, hard=True)
+		action = action.view(*out_dims, -1)
+		return action
+	
+class MADDPGCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.norm = torch.nn.BatchNorm1d(state_size[-1]+action_size[-1])
+		self.norm.weight.data.fill_(1)
+		self.norm.bias.data.fill_(0)
+		self.layer1 = torch.nn.Linear(state_size[-1]+action_size[-1], INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.q_value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		# self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, action):
+		state = torch.cat([state, action], -1)
+		# out_dims = state.size()[:-1]
+		# state = state.view(int(np.prod(out_dims)), -1)
+		# state = self.norm(state)
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		q_value = self.q_value(state)
+		# q_value = q_value.view(*out_dims, -1)
+		return q_value
+
+class MADDPGNetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=None):
+		super().__init__(tau=tau, gpu=gpu)
+		self.state_size = state_size
+		self.action_size = action_size
+		self.critic = MADDPGCritic([np.sum([np.prod(s) for s in self.state_size])], [np.sum([np.prod(a) for a in self.action_size])])
+		self.models = [DDPGNetwork(s_size, a_size, MADDPGActor, lambda s,a: self.critic, lr=lr, gpu=gpu, load=load) for s_size,a_size in zip(self.state_size, self.action_size)]
+		
+	def get_action_probs(self, state, use_target=False, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action = [model.get_action(s, use_target, grad, numpy, sample) for s,model in zip(state, self.models)]
+			return action
+
+	def get_q_value(self, state, action, use_target=False, grad=False, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			q_value = [model.get_q_value(state, action, use_target, grad, numpy) for model in self.models]
+			return q_value
+
+	def optimize(self, states, actions, states_joint, actions_joint, q_targets, e_weight=ENTROPY_WEIGHT):
+		for (i,model),state,q_target in zip(enumerate(self.models), states, q_targets):
+			q_values = model.get_q_value(states_joint, actions_joint, grad=True, numpy=False)
+			critic_error = q_values[:q_target.size(0)] - q_target.detach()
+			critic_loss = critic_error.pow(2)
+			model.step(model.critic_optimizer, critic_loss.mean(), param_norm=model.critic_local.parameters())
+			model.soft_copy(model.critic_local, model.critic_target)
+
+			actor_action = model.get_action(state, grad=True, numpy=False)
+			critic_action = [actor_action if j==i else one_hot(action) for j,action in enumerate(actions)]
+			action_joint = torch.cat([a.view(*a.size()[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(critic_action, self.action_size)], dim=-1)
+			q_actions = model.critic_local(states_joint, action_joint)
+			actor_loss = -(q_actions - q_values.detach()) + e_weight*actor_action.pow(2).mean()
+			model.step(model.actor_optimizer, actor_loss.mean(), param_norm=model.actor_local.parameters())
+			model.soft_copy(model.actor_local, model.actor_target)
+
+	def save_model(self, dirname="pytorch", name="best"):
+		[model.save_model("maddpg", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		[model.load_model("maddpg", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+class MADDPGAgent(PTACAgent):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, MADDPGNetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		eps = self.eps if eps is None else eps
+		action_random = super().get_action(state)
+		action_greedy = self.network.get_action_probs(self.to_tensor(state), sample=sample, numpy=numpy)
+		action = [(1-eps)*a_greedy + eps*a_random for a_greedy,a_random in zip(action_greedy, action_random)]
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, reward, done))
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+			states, actions, rewards, dones = map(lambda x: self.to_tensor(x), zip(*self.buffer))
+			self.buffer.clear()
+			next_state = self.to_tensor(next_state)
+			states = [torch.cat([s, ns.unsqueeze(0)], dim=0) for s,ns in zip(states, next_state)]
+			actions = [torch.cat([a, na.unsqueeze(0)], dim=0) for a,na in zip(actions, self.network.get_action_probs(next_state, use_target=True))]
+			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+			actions_joint = torch.cat([a.view(*a.size()[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(actions, self.action_size)], dim=-1)
+			q_values = self.network.get_q_value(states_joint, actions_joint, use_target=True)
+			q_targets = [self.compute_gae(q_value[-1], reward.unsqueeze(-1), done.unsqueeze(-1), q_value[:-1])[0] for q_value,reward,done in zip(q_values, rewards, dones)]
+			
+			to_stack = lambda items: list(zip(*[x.view(-1, *x.shape[2:]).cpu().numpy() for x in items]))
+			states, actions, states_joint, actions_joint = map(lambda items: [x[:-1] for x in items], [states, actions, [states_joint], [actions_joint]])
+			states, actions, states_joint, actions_joint, q_targets = map(to_stack, [states, actions, states_joint, actions_joint, q_targets])
+			self.replay_buffer.extend(list(zip(states, actions, states_joint, actions_joint, q_targets)), shuffle=False)	
+		if len(self.replay_buffer) > REPLAY_BATCH_SIZE:
+			states, actions, states_joint, actions_joint, q_targets = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)[0]
+			self.network.optimize(states, actions, states_joint[0], actions_joint[0], q_targets)
+		if np.any(done[0]): self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 1					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.900             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+# import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-4]
+env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False):
+	if env_name in gym_envs: return gym.make(env_name)
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	multiagent_args = {"number_of_left_players_agent_controls":3, "number_of_right_players_agent_controls":0} if env_name == "3_vs_3_custom" else {}
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=render, **multiagent_args)
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space}")
+	return FootballTeamEnv(env)
+
+def run(model, steps=10000, ports=16, env_name=env_name, eval_at=1000, checkpoint=False, save_best=False, log=True, render=True):
+	num_envs = len(ports) if type(ports) == list else min(ports, 64)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports, render=True, env_name=env_name)
+	agent = ParallelAgent(envs.state_size, envs.action_size, model, num_envs=num_envs, gpu=False, agent2=RandomAgent) 
+	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space)
+	states = envs.reset()
+	total_rewards = []
+	for s in range(steps):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		print(actions)
+		next_states, rewards, dones, _ = envs.step(env_actions)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if np.any(dones[0]):
+			rollouts = [rollout(envs.env, agent.reset(1), render=render) for _ in range(1)]
+			test_reward = np.mean(rollouts, axis=0) - np.std(rollouts, axis=0)
+			total_rewards.append(test_reward)
+			if checkpoint: agent.save_model(env_name, "checkpoint")
+			if save_best and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts, axis=0)} [{np.std(rollouts):.4f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.agent.eps:.3f})")
+			agent.reset(num_envs)
+
+def trial(model):
+	envs = EnsembleEnv(make_env, 0, log=True, render=True)
+	agent = ParallelAgent(envs.state_size, envs.action_size, model, load=f"{env_name}")
+	print(f"Reward: {rollout(envs.env, agent, eps=0.02, render=True)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[1], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="maddpg", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--test", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.test:
+		trial(model)
+	elif args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		run(model, args.steps, args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render)
+
+Step: 49, Reward: [-420.947 -420.947 -420.947] [0.0000], Avg: [-420.947 -420.947 -420.947] (0.995)
+Step: 99, Reward: [-615.374 -615.374 -615.374] [0.0000], Avg: [-518.16 -518.16 -518.16] (0.990)
+Step: 149, Reward: [-970.595 -970.595 -970.595] [0.0000], Avg: [-668.972 -668.972 -668.972] (0.985)
+Step: 199, Reward: [-747.526 -747.526 -747.526] [0.0000], Avg: [-688.61 -688.61 -688.61] (0.980)
+Step: 249, Reward: [-504.677 -504.677 -504.677] [0.0000], Avg: [-651.824 -651.824 -651.824] (0.975)
+Step: 299, Reward: [-417.123 -417.123 -417.123] [0.0000], Avg: [-612.707 -612.707 -612.707] (0.970)

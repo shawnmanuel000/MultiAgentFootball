@@ -1,0 +1,430 @@
+Model: <class 'multiagent.mappo.MAPPOAgent'>, Dir: simple_spread
+num_envs: 16, state_size: [(1, 18), (1, 18), (1, 18)], action_size: [[1, 5], [1, 5], [1, 5]], action_space: [MultiDiscrete([5]), MultiDiscrete([5]), MultiDiscrete([5])], envs: <class 'utils.envs.EnvManager'>,
+
+import torch
+import random
+import numpy as np
+from models.ppo import PPONetwork
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, MultiheadAttention, one_hot_from_indices, gsoftmax
+
+ENTROPY_WEIGHT = 0.01			# The weight for the entropy term of the Actor loss
+CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old probabilities
+BATCH_SIZE = 640
+PPO_EPOCHS = 5
+TIME_BATCH = 10
+MAX_BUFFER_SIZE = 640
+
+class MAPPOActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.norm1 = torch.nn.LayerNorm(ACTOR_HIDDEN)
+		self.norm2 = torch.nn.LayerNorm(ACTOR_HIDDEN)
+		self.layer1 = torch.nn.Linear(state_size[-1], ACTOR_HIDDEN)
+		self.layer2 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		# self.attention = MultiheadAttention(ACTOR_HIDDEN, 8, 32)
+		# self.attention = torch.nn.modules.MultiheadAttention(1, 1)
+		self.recurrent = torch.nn.GRUCell(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.action_sig = torch.nn.Parameter(torch.zeros(action_size[-1]))
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		self.init_hidden()
+
+	def forward(self, state, action=None, sample=True):
+		state = self.norm1(self.layer1(state)).relu()
+		state = self.norm2(self.layer2(state)).relu()
+
+		out_dims = state.shape[:-1]
+		state = state.reshape(-1, state.shape[-1])
+		if self.hidden.size(0) != state.size(0): self.init_hidden(state.size(0), state.device)
+		self.hidden = self.recurrent(state, self.hidden)
+		action_mu = self.action_mu(self.hidden)
+		action_mu = action_mu.reshape(*out_dims, action_mu.shape[-1])
+
+		# action_mu = self.action_mu(state)
+
+		action_probs = action_mu.softmax(-1)
+		dist = torch.distributions.Categorical(action_probs)
+		action = dist.sample() if action is None else action.argmax(-1)
+		action_one_hot = one_hot_from_indices(action, action_probs.size(-1))
+		log_prob = dist.log_prob(action)
+		entropy = dist.entropy()
+		return action_one_hot, log_prob, entropy
+
+	def init_hidden(self, batch_size=1, device=torch.device("cpu")):
+		self.hidden = torch.zeros([batch_size, ACTOR_HIDDEN]).to(device)
+
+class MAPPOCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], CRITIC_HIDDEN)
+		self.layer2 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		value = self.value(state)
+		return value
+
+class MAPPONetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(gpu=gpu, name="mappo")
+		self.state_size = state_size
+		self.action_size = action_size
+		self.actor = MAPPOActor(state_size[0], action_size[0])
+		self.critic = lambda s,a: MAPPOCritic([np.sum([np.prod(s) for s in self.state_size])], [np.sum([np.prod(a) for a in self.action_size])])
+		self.models = [PPONetwork(s_size, a_size, lambda s,a: self.actor, self.critic, lr=lr/len(state_size), gpu=gpu, load=load) for s_size,a_size in zip(self.state_size, self.action_size)]
+		[[m.train() for m in [model.actor_local, model.critic_local]] for model in self.models]
+		if load: self.load_model(load)
+
+	def get_action_probs(self, state, action_in=None, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action_in = [None] * len(state) if action_in is None else action_in
+			action_or_entropy, log_prob = map(list, zip(*[model.get_action_probs(s, a, grad=grad, numpy=numpy, sample=sample) for s,a,model in zip(state, action_in, self.models)]))
+			return action_or_entropy, log_prob
+
+	def get_value(self, state, grad=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			q_value = [model.get_value(state, grad) for model in self.models]
+			return q_value
+
+	def optimize(self, states, actions, old_log_probs, targets, advantages, clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+		for model, state, action, old_log_prob, target, advantage in zip(self.models, states, actions, old_log_probs, targets, advantages):		
+			[m.train() for m in [model.actor_local, model.critic_local]]
+			values = model.get_value(states_joint, grad=True)
+			critic_error = values - target.detach()
+			critic_loss = critic_error.pow(2)
+			model.step(model.critic_optimizer, critic_loss.mean(), model.critic_local.parameters())
+
+			model.actor_local.init_hidden(state.size(0), state.device)
+			entropy, new_log_prob = zip(*[model.get_action_probs(state[:,t], action[:,t], grad=True, numpy=False) for t in range(state.size(1))])
+			new_log_prob = torch.stack(new_log_prob, dim=1)
+			entropy = torch.stack(entropy).mean()
+			# entropy, new_log_prob = model.get_action_probs(state, action, grad=True, numpy=False)
+			ratio = (new_log_prob - old_log_prob).exp()
+			ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+			advantage = advantage.view(*advantage.shape, *[1]*(len(ratio.shape)-len(advantage.shape)))
+			actor_loss = -(torch.min(ratio*advantage, ratio_clipped*advantage) + e_weight*entropy) * scale
+			model.step(model.actor_optimizer, actor_loss.mean(), model.actor_local.parameters())
+			[m.eval() for m in [model.actor_local, model.critic_local]]
+
+	def save_model(self, dirname="pytorch", name="checkpoint"):
+		[PTACNetwork.save_model(model, self.name, dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+	def load_model(self, dirname="pytorch", name="checkpoint"):
+		[PTACNetwork.load_model(model, self.name, dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+class MAPPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
+		super().__init__(state_size, action_size, MAPPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		action, self.log_prob = self.network.get_action_probs(self.to_tensor(state), numpy=True, sample=sample)
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, self.log_prob, reward, done))
+		if np.any(done[0]):
+			states, actions, log_probs, rewards, dones = map(lambda x: self.to_tensor(x), zip(*self.buffer))
+			self.buffer.clear()
+			states = [torch.cat([s, ns.unsqueeze(0)], dim=0) for s,ns in zip(states, self.to_tensor(next_state))]
+			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+			values = self.network.get_value(states_joint)
+			targets, advantages = zip(*[self.compute_gae(value[-1], reward.unsqueeze(-1), done.unsqueeze(-1), value[:-1]) for value,reward,done in zip(values, rewards, dones)])
+			time_split = lambda x: list(zip(*[t.view(-1,TIME_BATCH,*t.shape[1:]).transpose(0,1).reshape(TIME_BATCH,-1,*t.shape[2:]).transpose(0,1) for t in x]))
+			states, actions, log_probs, targets, advantages = [time_split(x) for x in [[s[:-1] for s in states], actions, log_probs, targets, advantages]]
+			self.replay_buffer.extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
+		if len(self.replay_buffer) >= MAX_BUFFER_SIZE:
+			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
+				states, actions, log_probs, targets, advantages = self.replay_buffer.next_batch(BATCH_SIZE, lambda x: [torch.stack(l) for l in list(zip(*x))])
+				self.network.optimize(states, actions, log_probs, targets, advantages)
+			self.replay_buffer.clear()
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 256				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 512			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.000               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.sac import SACAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-4]
+env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	multiagent_args = {"number_of_left_players_agent_controls":3, "number_of_right_players_agent_controls":3} if env_name == "3_vs_3_custom" else {}
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=render, **multiagent_args)
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward: [(ballr(o[0,88], o[0,89]) + o[0,95]-o[0,96] + 2*r)/4 for o,r in zip(obs,reward)]
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space}")
+	return FootballTeamEnv(env, reward_fn)
+
+def run(model, steps=10000, ports=16, env_name=env_name, trial_at=1000, save_at=10, checkpoint=True, save_best=False, log=True, render=False, load=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name), ports)
+	agent = (SelfPlayAgent if env_name=="3_vs_3_custom" else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load=f"{env_name}" if load else "", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=False) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs))
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s>0 and s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s}, Reward: {total_rewards[-1]} [{np.std(rollouts):.4f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.agent.eps:.3f})")
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = (SelfPlayAgent if env_name=="3_vs_3_custom" else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}", agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {np.mean([rollout(envs.env, agent, eps=0.0, render=True) for _ in range(5)], axis=0)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="mappo", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.trial:
+		trial(model=model, env_name=env_name, render=args.render)
+	elif args.selfport is not None or MPI_RANK>0 :
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	else:
+		run(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render)
+
+
+Step: 1000, Reward: [-493.436 -493.436 -493.436] [122.0795], Avg: [-493.436 -493.436 -493.436] (1.000)
+Step: 2000, Reward: [-533.23 -533.23 -533.23] [140.2877], Avg: [-513.333 -513.333 -513.333] (1.000)
+Step: 3000, Reward: [-514.847 -514.847 -514.847] [110.9045], Avg: [-513.838 -513.838 -513.838] (1.000)
+Step: 4000, Reward: [-488.965 -488.965 -488.965] [86.0201], Avg: [-507.619 -507.619 -507.619] (1.000)
+Step: 5000, Reward: [-558.019 -558.019 -558.019] [133.8519], Avg: [-517.699 -517.699 -517.699] (1.000)
+Step: 6000, Reward: [-497.995 -497.995 -497.995] [111.4709], Avg: [-514.415 -514.415 -514.415] (1.000)
+Step: 7000, Reward: [-513.803 -513.803 -513.803] [121.3028], Avg: [-514.328 -514.328 -514.328] (1.000)
+Step: 8000, Reward: [-479.332 -479.332 -479.332] [109.3547], Avg: [-509.953 -509.953 -509.953] (1.000)
+Step: 9000, Reward: [-474.192 -474.192 -474.192] [72.9525], Avg: [-505.98 -505.98 -505.98] (1.000)
+Step: 10000, Reward: [-500.826 -500.826 -500.826] [85.0087], Avg: [-505.464 -505.464 -505.464] (1.000)
+Step: 11000, Reward: [-495.836 -495.836 -495.836] [74.6167], Avg: [-504.589 -504.589 -504.589] (1.000)
+Step: 12000, Reward: [-491.353 -491.353 -491.353] [78.0715], Avg: [-503.486 -503.486 -503.486] (1.000)
+Step: 13000, Reward: [-486.282 -486.282 -486.282] [93.8925], Avg: [-502.163 -502.163 -502.163] (1.000)
+Step: 14000, Reward: [-482.769 -482.769 -482.769] [71.9782], Avg: [-500.777 -500.777 -500.777] (1.000)
+Step: 15000, Reward: [-510.581 -510.581 -510.581] [144.0002], Avg: [-501.431 -501.431 -501.431] (1.000)
+Step: 16000, Reward: [-491.534 -491.534 -491.534] [109.1523], Avg: [-500.812 -500.812 -500.812] (1.000)
+Step: 17000, Reward: [-534.383 -534.383 -534.383] [118.6038], Avg: [-502.787 -502.787 -502.787] (1.000)
+Step: 18000, Reward: [-503.125 -503.125 -503.125] [83.0884], Avg: [-502.806 -502.806 -502.806] (1.000)
+Step: 19000, Reward: [-493.535 -493.535 -493.535] [68.3600], Avg: [-502.318 -502.318 -502.318] (1.000)
+Step: 20000, Reward: [-513.551 -513.551 -513.551] [128.6454], Avg: [-502.88 -502.88 -502.88] (1.000)
+Step: 21000, Reward: [-503.155 -503.155 -503.155] [110.9412], Avg: [-502.893 -502.893 -502.893] (1.000)
+Step: 22000, Reward: [-517.025 -517.025 -517.025] [123.8447], Avg: [-503.535 -503.535 -503.535] (1.000)
+Step: 23000, Reward: [-564.84 -564.84 -564.84] [92.6582], Avg: [-506.201 -506.201 -506.201] (1.000)
+Step: 24000, Reward: [-573.347 -573.347 -573.347] [117.7992], Avg: [-508.998 -508.998 -508.998] (1.000)
+Step: 25000, Reward: [-522.19 -522.19 -522.19] [108.2846], Avg: [-509.526 -509.526 -509.526] (1.000)
+Step: 26000, Reward: [-566.425 -566.425 -566.425] [132.8853], Avg: [-511.714 -511.714 -511.714] (1.000)
+Step: 27000, Reward: [-641.498 -641.498 -641.498] [159.2595], Avg: [-516.521 -516.521 -516.521] (1.000)
+Step: 28000, Reward: [-650.436 -650.436 -650.436] [140.9049], Avg: [-521.304 -521.304 -521.304] (1.000)
+Step: 29000, Reward: [-763.93 -763.93 -763.93] [145.4362], Avg: [-529.67 -529.67 -529.67] (1.000)
+Step: 30000, Reward: [-748.578 -748.578 -748.578] [173.6478], Avg: [-536.967 -536.967 -536.967] (1.000)
+Step: 31000, Reward: [-708.887 -708.887 -708.887] [220.5727], Avg: [-542.513 -542.513 -542.513] (1.000)
+Step: 32000, Reward: [-644.265 -644.265 -644.265] [136.0949], Avg: [-545.693 -545.693 -545.693] (1.000)
+Step: 33000, Reward: [-593.872 -593.872 -593.872] [235.2942], Avg: [-547.153 -547.153 -547.153] (1.000)
+Step: 34000, Reward: [-668.828 -668.828 -668.828] [157.9144], Avg: [-550.731 -550.731 -550.731] (1.000)
+Step: 35000, Reward: [-624.586 -624.586 -624.586] [262.4151], Avg: [-552.842 -552.842 -552.842] (1.000)
+Step: 36000, Reward: [-798.54 -798.54 -798.54] [213.1224], Avg: [-559.667 -559.667 -559.667] (1.000)
+Step: 37000, Reward: [-1013.693 -1013.693 -1013.693] [277.4097], Avg: [-571.938 -571.938 -571.938] (1.000)
+Step: 38000, Reward: [-903.412 -903.412 -903.412] [353.4299], Avg: [-580.661 -580.661 -580.661] (1.000)
+Step: 39000, Reward: [-785.776 -785.776 -785.776] [246.3432], Avg: [-585.92 -585.92 -585.92] (1.000)
+Step: 40000, Reward: [-741.751 -741.751 -741.751] [327.4600], Avg: [-589.816 -589.816 -589.816] (1.000)
+Step: 41000, Reward: [-569.329 -569.329 -569.329] [252.2596], Avg: [-589.316 -589.316 -589.316] (1.000)
+Step: 42000, Reward: [-659.313 -659.313 -659.313] [252.1795], Avg: [-590.983 -590.983 -590.983] (1.000)
+Step: 43000, Reward: [-781.467 -781.467 -781.467] [300.1195], Avg: [-595.412 -595.412 -595.412] (1.000)
+Step: 44000, Reward: [-828.676 -828.676 -828.676] [420.1627], Avg: [-600.714 -600.714 -600.714] (1.000)
+Step: 45000, Reward: [-890.564 -890.564 -890.564] [295.8594], Avg: [-607.155 -607.155 -607.155] (1.000)
+Step: 46000, Reward: [-1033.606 -1033.606 -1033.606] [379.3476], Avg: [-616.426 -616.426 -616.426] (1.000)
+Step: 47000, Reward: [-998.283 -998.283 -998.283] [437.0682], Avg: [-624.55 -624.55 -624.55] (1.000)
+Step: 48000, Reward: [-777.6 -777.6 -777.6] [394.5294], Avg: [-627.739 -627.739 -627.739] (1.000)
+Step: 49000, Reward: [-819.206 -819.206 -819.206] [395.3041], Avg: [-631.646 -631.646 -631.646] (1.000)
+Step: 50000, Reward: [-812.333 -812.333 -812.333] [376.6128], Avg: [-635.26 -635.26 -635.26] (1.000)
+Step: 51000, Reward: [-705.01 -705.01 -705.01] [254.0832], Avg: [-636.628 -636.628 -636.628] (1.000)
+Step: 52000, Reward: [-884.131 -884.131 -884.131] [524.1810], Avg: [-641.387 -641.387 -641.387] (1.000)
+Step: 53000, Reward: [-1271.401 -1271.401 -1271.401] [480.6946], Avg: [-653.274 -653.274 -653.274] (1.000)
+Step: 54000, Reward: [-962.843 -962.843 -962.843] [449.7999], Avg: [-659.007 -659.007 -659.007] (1.000)
+Step: 55000, Reward: [-1061.563 -1061.563 -1061.563] [561.9702], Avg: [-666.326 -666.326 -666.326] (1.000)
+Step: 56000, Reward: [-1200.312 -1200.312 -1200.312] [542.8485], Avg: [-675.862 -675.862 -675.862] (1.000)
+Step: 57000, Reward: [-785.558 -785.558 -785.558] [395.4099], Avg: [-677.786 -677.786 -677.786] (1.000)
+Step: 58000, Reward: [-746.665 -746.665 -746.665] [376.0837], Avg: [-678.974 -678.974 -678.974] (1.000)
+Step: 59000, Reward: [-832.557 -832.557 -832.557] [487.2399], Avg: [-681.577 -681.577 -681.577] (1.000)
+Step: 60000, Reward: [-897.495 -897.495 -897.495] [367.0875], Avg: [-685.176 -685.176 -685.176] (1.000)
+Step: 61000, Reward: [-1060.511 -1060.511 -1060.511] [560.2930], Avg: [-691.329 -691.329 -691.329] (1.000)
+Step: 62000, Reward: [-1389.461 -1389.461 -1389.461] [470.3999], Avg: [-702.589 -702.589 -702.589] (1.000)
+Step: 63000, Reward: [-1226.359 -1226.359 -1226.359] [590.6945], Avg: [-710.903 -710.903 -710.903] (1.000)
+Step: 64000, Reward: [-1065.126 -1065.126 -1065.126] [605.9658], Avg: [-716.437 -716.437 -716.437] (1.000)
+Step: 65000, Reward: [-1100.51 -1100.51 -1100.51] [302.8788], Avg: [-722.346 -722.346 -722.346] (1.000)
+Step: 66000, Reward: [-838.782 -838.782 -838.782] [500.6022], Avg: [-724.11 -724.11 -724.11] (1.000)
+Step: 67000, Reward: [-1168.69 -1168.69 -1168.69] [456.7977], Avg: [-730.746 -730.746 -730.746] (1.000)
+Step: 68000, Reward: [-1117.863 -1117.863 -1117.863] [551.0638], Avg: [-736.439 -736.439 -736.439] (1.000)
+Step: 69000, Reward: [-885.786 -885.786 -885.786] [542.1261], Avg: [-738.603 -738.603 -738.603] (1.000)
+Step: 70000, Reward: [-1220.301 -1220.301 -1220.301] [540.3860], Avg: [-745.485 -745.485 -745.485] (1.000)
+Step: 71000, Reward: [-1311.852 -1311.852 -1311.852] [556.8545], Avg: [-753.462 -753.462 -753.462] (1.000)
+Step: 72000, Reward: [-1028.411 -1028.411 -1028.411] [506.6056], Avg: [-757.28 -757.28 -757.28] (1.000)
+Step: 73000, Reward: [-997.04 -997.04 -997.04] [485.6692], Avg: [-760.565 -760.565 -760.565] (1.000)
+Step: 74000, Reward: [-1094.549 -1094.549 -1094.549] [571.0821], Avg: [-765.078 -765.078 -765.078] (1.000)
+Step: 75000, Reward: [-1051.002 -1051.002 -1051.002] [629.4813], Avg: [-768.89 -768.89 -768.89] (1.000)
+Step: 76000, Reward: [-940.436 -940.436 -940.436] [593.4873], Avg: [-771.148 -771.148 -771.148] (1.000)
+Step: 77000, Reward: [-900.85 -900.85 -900.85] [427.1594], Avg: [-772.832 -772.832 -772.832] (1.000)
+Step: 78000, Reward: [-891.344 -891.344 -891.344] [405.5325], Avg: [-774.351 -774.351 -774.351] (1.000)
+Step: 79000, Reward: [-1051.018 -1051.018 -1051.018] [368.2154], Avg: [-777.854 -777.854 -777.854] (1.000)
+Step: 80000, Reward: [-1143.053 -1143.053 -1143.053] [394.1100], Avg: [-782.419 -782.419 -782.419] (1.000)
+Step: 81000, Reward: [-957.574 -957.574 -957.574] [412.5260], Avg: [-784.581 -784.581 -784.581] (1.000)
+Step: 82000, Reward: [-1113.573 -1113.573 -1113.573] [415.2664], Avg: [-788.593 -788.593 -788.593] (1.000)
+Step: 83000, Reward: [-805.589 -805.589 -805.589] [389.8382], Avg: [-788.798 -788.798 -788.798] (1.000)
+Step: 84000, Reward: [-915.812 -915.812 -915.812] [572.3839], Avg: [-790.31 -790.31 -790.31] (1.000)
+Step: 85000, Reward: [-1015.626 -1015.626 -1015.626] [518.0040], Avg: [-792.961 -792.961 -792.961] (1.000)
+Step: 86000, Reward: [-1021.345 -1021.345 -1021.345] [436.0115], Avg: [-795.616 -795.616 -795.616] (1.000)
+Step: 87000, Reward: [-989.708 -989.708 -989.708] [387.8373], Avg: [-797.847 -797.847 -797.847] (1.000)
+Step: 88000, Reward: [-1188.611 -1188.611 -1188.611] [467.8972], Avg: [-802.288 -802.288 -802.288] (1.000)
+Step: 89000, Reward: [-967.783 -967.783 -967.783] [478.2996], Avg: [-804.147 -804.147 -804.147] (1.000)
+Step: 90000, Reward: [-878.117 -878.117 -878.117] [398.8575], Avg: [-804.969 -804.969 -804.969] (1.000)
+Step: 91000, Reward: [-839.183 -839.183 -839.183] [317.9203], Avg: [-805.345 -805.345 -805.345] (1.000)
+Step: 92000, Reward: [-833.562 -833.562 -833.562] [488.1636], Avg: [-805.652 -805.652 -805.652] (1.000)
+Step: 93000, Reward: [-1063.664 -1063.664 -1063.664] [437.4772], Avg: [-808.426 -808.426 -808.426] (1.000)
+Step: 94000, Reward: [-805.4 -805.4 -805.4] [285.4673], Avg: [-808.394 -808.394 -808.394] (1.000)
+Step: 95000, Reward: [-774.956 -774.956 -774.956] [313.2668], Avg: [-808.042 -808.042 -808.042] (1.000)
+Step: 96000, Reward: [-855.046 -855.046 -855.046] [420.0876], Avg: [-808.532 -808.532 -808.532] (1.000)
+Step: 97000, Reward: [-725.779 -725.779 -725.779] [281.2182], Avg: [-807.678 -807.678 -807.678] (1.000)
+Step: 98000, Reward: [-1022.365 -1022.365 -1022.365] [543.4985], Avg: [-809.869 -809.869 -809.869] (1.000)
+Step: 99000, Reward: [-903.911 -903.911 -903.911] [411.7778], Avg: [-810.819 -810.819 -810.819] (1.000)
+Step: 100000, Reward: [-982.274 -982.274 -982.274] [414.2880], Avg: [-812.534 -812.534 -812.534] (1.000)
+Step: 101000, Reward: [-830.626 -830.626 -830.626] [272.8696], Avg: [-812.713 -812.713 -812.713] (1.000)
+Step: 102000, Reward: [-1079.838 -1079.838 -1079.838] [353.8986], Avg: [-815.332 -815.332 -815.332] (1.000)
+Step: 103000, Reward: [-1022.146 -1022.146 -1022.146] [433.8516], Avg: [-817.34 -817.34 -817.34] (1.000)
+Step: 104000, Reward: [-1025.721 -1025.721 -1025.721] [432.3801], Avg: [-819.343 -819.343 -819.343] (1.000)
+Step: 105000, Reward: [-1021.706 -1021.706 -1021.706] [500.9182], Avg: [-821.27 -821.27 -821.27] (1.000)
+Step: 106000, Reward: [-958.059 -958.059 -958.059] [420.5030], Avg: [-822.561 -822.561 -822.561] (1.000)
+Step: 107000, Reward: [-981.635 -981.635 -981.635] [342.5161], Avg: [-824.048 -824.048 -824.048] (1.000)
+Step: 108000, Reward: [-981.636 -981.636 -981.636] [302.6544], Avg: [-825.507 -825.507 -825.507] (1.000)
+Step: 109000, Reward: [-1202.072 -1202.072 -1202.072] [435.3264], Avg: [-828.961 -828.961 -828.961] (1.000)
+Step: 110000, Reward: [-959.206 -959.206 -959.206] [277.3159], Avg: [-830.146 -830.146 -830.146] (1.000)
+Step: 111000, Reward: [-1030.871 -1030.871 -1030.871] [409.2018], Avg: [-831.954 -831.954 -831.954] (1.000)
+Step: 112000, Reward: [-1092.976 -1092.976 -1092.976] [458.5127], Avg: [-834.284 -834.284 -834.284] (1.000)
+Step: 113000, Reward: [-885.225 -885.225 -885.225] [309.7934], Avg: [-834.735 -834.735 -834.735] (1.000)
+Step: 114000, Reward: [-994.396 -994.396 -994.396] [453.1210], Avg: [-836.136 -836.136 -836.136] (1.000)
+Step: 115000, Reward: [-1060.51 -1060.51 -1060.51] [370.0673], Avg: [-838.087 -838.087 -838.087] (1.000)
+Step: 116000, Reward: [-1086.782 -1086.782 -1086.782] [366.0466], Avg: [-840.231 -840.231 -840.231] (1.000)
+Step: 117000, Reward: [-1126.642 -1126.642 -1126.642] [332.1040], Avg: [-842.679 -842.679 -842.679] (1.000)
+Step: 118000, Reward: [-1220.034 -1220.034 -1220.034] [351.7698], Avg: [-845.877 -845.877 -845.877] (1.000)
+Step: 119000, Reward: [-1306.893 -1306.893 -1306.893] [273.6520], Avg: [-849.751 -849.751 -849.751] (1.000)
+Step: 120000, Reward: [-1239.937 -1239.937 -1239.937] [339.9679], Avg: [-853.002 -853.002 -853.002] (1.000)
+Step: 121000, Reward: [-966.96 -966.96 -966.96] [278.9546], Avg: [-853.944 -853.944 -853.944] (1.000)
+Step: 122000, Reward: [-1253.669 -1253.669 -1253.669] [238.8832], Avg: [-857.221 -857.221 -857.221] (1.000)
+Step: 123000, Reward: [-1063.808 -1063.808 -1063.808] [379.1817], Avg: [-858.9 -858.9 -858.9] (1.000)
+Step: 124000, Reward: [-1228.039 -1228.039 -1228.039] [389.2195], Avg: [-861.877 -861.877 -861.877] (1.000)
+Step: 125000, Reward: [-1186.129 -1186.129 -1186.129] [365.9782], Avg: [-864.471 -864.471 -864.471] (1.000)
+Step: 126000, Reward: [-1329.707 -1329.707 -1329.707] [306.2462], Avg: [-868.163 -868.163 -868.163] (1.000)
+Step: 127000, Reward: [-1288.596 -1288.596 -1288.596] [438.0491], Avg: [-871.474 -871.474 -871.474] (1.000)
+Step: 128000, Reward: [-1246.065 -1246.065 -1246.065] [281.2073], Avg: [-874.4 -874.4 -874.4] (1.000)
+Step: 129000, Reward: [-1131.914 -1131.914 -1131.914] [317.6370], Avg: [-876.397 -876.397 -876.397] (1.000)
+Step: 130000, Reward: [-1042.612 -1042.612 -1042.612] [322.9726], Avg: [-877.675 -877.675 -877.675] (1.000)
+Step: 131000, Reward: [-1115.132 -1115.132 -1115.132] [335.7281], Avg: [-879.488 -879.488 -879.488] (1.000)
+Step: 132000, Reward: [-1391.302 -1391.302 -1391.302] [260.8809], Avg: [-883.365 -883.365 -883.365] (1.000)
+Step: 133000, Reward: [-1487.75 -1487.75 -1487.75] [274.2451], Avg: [-887.909 -887.909 -887.909] (1.000)
+Step: 134000, Reward: [-1251.447 -1251.447 -1251.447] [395.0963], Avg: [-890.622 -890.622 -890.622] (1.000)
+Step: 135000, Reward: [-1236.614 -1236.614 -1236.614] [297.5619], Avg: [-893.185 -893.185 -893.185] (1.000)
+Step: 136000, Reward: [-1278.764 -1278.764 -1278.764] [427.6945], Avg: [-896.02 -896.02 -896.02] (1.000)
+Step: 137000, Reward: [-1422.552 -1422.552 -1422.552] [334.2508], Avg: [-899.864 -899.864 -899.864] (1.000)
+Step: 138000, Reward: [-1260.064 -1260.064 -1260.064] [310.3630], Avg: [-902.474 -902.474 -902.474] (1.000)
+Step: 139000, Reward: [-1480.737 -1480.737 -1480.737] [258.1618], Avg: [-906.634 -906.634 -906.634] (1.000)
+Step: 140000, Reward: [-1302.815 -1302.815 -1302.815] [385.5861], Avg: [-909.464 -909.464 -909.464] (1.000)
+Step: 141000, Reward: [-1425.907 -1425.907 -1425.907] [289.7821], Avg: [-913.127 -913.127 -913.127] (1.000)
+Step: 142000, Reward: [-1462.479 -1462.479 -1462.479] [299.4101], Avg: [-916.995 -916.995 -916.995] (1.000)
+Step: 143000, Reward: [-1133.749 -1133.749 -1133.749] [308.5938], Avg: [-918.511 -918.511 -918.511] (1.000)
+Step: 144000, Reward: [-1233.161 -1233.161 -1233.161] [362.4021], Avg: [-920.696 -920.696 -920.696] (1.000)
+Step: 145000, Reward: [-1294.702 -1294.702 -1294.702] [228.1707], Avg: [-923.276 -923.276 -923.276] (1.000)
+Step: 146000, Reward: [-1263.217 -1263.217 -1263.217] [305.6216], Avg: [-925.604 -925.604 -925.604] (1.000)
+Step: 147000, Reward: [-1488.421 -1488.421 -1488.421] [225.9529], Avg: [-929.433 -929.433 -929.433] (1.000)
+Step: 148000, Reward: [-1671.552 -1671.552 -1671.552] [206.0851], Avg: [-934.447 -934.447 -934.447] (1.000)
+Step: 149000, Reward: [-1625.606 -1625.606 -1625.606] [228.2526], Avg: [-939.086 -939.086 -939.086] (1.000)
+Step: 150000, Reward: [-1609.556 -1609.556 -1609.556] [318.9331], Avg: [-943.555 -943.555 -943.555] (1.000)
+Step: 151000, Reward: [-1489.758 -1489.758 -1489.758] [223.6485], Avg: [-947.173 -947.173 -947.173] (1.000)
+Step: 152000, Reward: [-1450.197 -1450.197 -1450.197] [258.6987], Avg: [-950.482 -950.482 -950.482] (1.000)
+Step: 153000, Reward: [-1521.573 -1521.573 -1521.573] [299.9698], Avg: [-954.215 -954.215 -954.215] (1.000)
+Step: 154000, Reward: [-1616.976 -1616.976 -1616.976] [265.0417], Avg: [-958.518 -958.518 -958.518] (1.000)
+Step: 155000, Reward: [-1617.908 -1617.908 -1617.908] [185.4377], Avg: [-962.772 -962.772 -962.772] (1.000)
+Step: 156000, Reward: [-1795.367 -1795.367 -1795.367] [289.2086], Avg: [-968.109 -968.109 -968.109] (1.000)
+Step: 157000, Reward: [-1717.829 -1717.829 -1717.829] [171.3272], Avg: [-972.885 -972.885 -972.885] (1.000)
+Step: 158000, Reward: [-1710.054 -1710.054 -1710.054] [205.6498], Avg: [-977.55 -977.55 -977.55] (1.000)
+Step: 159000, Reward: [-1725.146 -1725.146 -1725.146] [182.0811], Avg: [-982.252 -982.252 -982.252] (1.000)
+Step: 160000, Reward: [-1866.38 -1866.38 -1866.38] [173.3848], Avg: [-987.778 -987.778 -987.778] (1.000)
+Step: 161000, Reward: [-1819.768 -1819.768 -1819.768] [204.3716], Avg: [-992.946 -992.946 -992.946] (1.000)
+Step: 162000, Reward: [-1836.579 -1836.579 -1836.579] [139.7247], Avg: [-998.153 -998.153 -998.153] (1.000)
+Step: 163000, Reward: [-1686.334 -1686.334 -1686.334] [152.3212], Avg: [-1002.375 -1002.375 -1002.375] (1.000)
+Step: 164000, Reward: [-1774.343 -1774.343 -1774.343] [241.8407], Avg: [-1007.082 -1007.082 -1007.082] (1.000)
+Step: 165000, Reward: [-1790.763 -1790.763 -1790.763] [238.0228], Avg: [-1011.832 -1011.832 -1011.832] (1.000)
+Step: 166000, Reward: [-1877.865 -1877.865 -1877.865] [121.8111], Avg: [-1017.049 -1017.049 -1017.049] (1.000)
+Step: 167000, Reward: [-1855.247 -1855.247 -1855.247] [158.3597], Avg: [-1022.068 -1022.068 -1022.068] (1.000)
+Step: 168000, Reward: [-1832.521 -1832.521 -1832.521] [139.3642], Avg: [-1026.892 -1026.892 -1026.892] (1.000)
+Step: 169000, Reward: [-1839.47 -1839.47 -1839.47] [170.7213], Avg: [-1031.7 -1031.7 -1031.7] (1.000)
+Step: 170000, Reward: [-1842.996 -1842.996 -1842.996] [209.2373], Avg: [-1036.473 -1036.473 -1036.473] (1.000)
+Step: 171000, Reward: [-1839.208 -1839.208 -1839.208] [137.1485], Avg: [-1041.167 -1041.167 -1041.167] (1.000)
+Step: 172000, Reward: [-1910.321 -1910.321 -1910.321] [129.7485], Avg: [-1046.22 -1046.22 -1046.22] (1.000)
+Step: 173000, Reward: [-1937.379 -1937.379 -1937.379] [182.3719], Avg: [-1051.372 -1051.372 -1051.372] (1.000)
+Step: 174000, Reward: [-1822.986 -1822.986 -1822.986] [193.5358], Avg: [-1055.806 -1055.806 -1055.806] (1.000)
+Step: 175000, Reward: [-1823.268 -1823.268 -1823.268] [204.4182], Avg: [-1060.192 -1060.192 -1060.192] (1.000)
+Step: 176000, Reward: [-1797.164 -1797.164 -1797.164] [174.3467], Avg: [-1064.379 -1064.379 -1064.379] (1.000)
+Step: 177000, Reward: [-1838.144 -1838.144 -1838.144] [214.9574], Avg: [-1068.751 -1068.751 -1068.751] (1.000)
+Step: 178000, Reward: [-1860.442 -1860.442 -1860.442] [218.0854], Avg: [-1073.198 -1073.198 -1073.198] (1.000)
+Step: 179000, Reward: [-1786.706 -1786.706 -1786.706] [165.8599], Avg: [-1077.184 -1077.184 -1077.184] (1.000)
+Step: 180000, Reward: [-1767.286 -1767.286 -1767.286] [180.8469], Avg: [-1081.018 -1081.018 -1081.018] (1.000)
+Step: 181000, Reward: [-1803.882 -1803.882 -1803.882] [126.6995], Avg: [-1085.012 -1085.012 -1085.012] (1.000)
+Step: 182000, Reward: [-1746.98 -1746.98 -1746.98] [173.1603], Avg: [-1088.649 -1088.649 -1088.649] (1.000)
+Step: 183000, Reward: [-1844.507 -1844.507 -1844.507] [209.9546], Avg: [-1092.779 -1092.779 -1092.779] (1.000)
+Step: 184000, Reward: [-1761.752 -1761.752 -1761.752] [135.8398], Avg: [-1096.415 -1096.415 -1096.415] (1.000)

@@ -2,11 +2,13 @@ import os
 import re
 import gym
 import cv2
+import time
 import torch
 import random
 import inspect
+import datetime
 import numpy as np
-import matplotlib.pyplot as plt
+np.set_printoptions(precision=3, sign=' ', floatmode="fixed")
 
 IMG_DIM = 64					# The height and width to scale the environment image to
 
@@ -18,11 +20,6 @@ def resize(image, scale=0.5):
 	dim = (int(image.shape[0]*scale), int(image.shape[1]*scale))
 	img = cv2.resize(image, dsize=dim, interpolation=cv2.INTER_CUBIC)
 	return np.expand_dims(img, -1) if image.shape[-1]==1 else img
-
-def show_image(img, filename="test.png", save=True):
-	if save: plt.imsave(filename, img)
-	plt.imshow(img, cmap=plt.get_cmap('gray'))
-	plt.show()
 
 def make_video(imgs, dim, filename):
 	video = cv2.VideoWriter(filename, 0, 60, dim)
@@ -44,20 +41,20 @@ def from_env(env, env_action):
 
 def rollout(env, agent, eps=None, render=False, sample=False):
 	state = env.reset()
-	total_reward = 0
+	total_reward = None
 	done = False
 	with torch.no_grad():
-		while not done:
+		while not np.all(done):
 			if render: env.render()
 			env_action = agent.get_env_action(env, state, eps, sample)[0]
-			env_action = env_action if hasattr(env.action_space, "n") else env_action.reshape(-1)
 			state, reward, done, _ = env.step(env_action)
-			total_reward += reward
+			reward = np.array(reward) if type(reward) == list else reward
+			total_reward = reward if total_reward is None else total_reward + reward
 	return total_reward
 
 class Logger():
 	def __init__(self, model_class, label, **kwconfig):
-		models = ["ddqn", "ddpg", "ppo", "rand"]
+		models = ["ddqn", "ddpg", "ppo", "rand", "coma", "maddpg", "mappo"]
 		self.config = kwconfig
 		self.label = label
 		self.model_class = model_class
@@ -70,16 +67,17 @@ class Logger():
 		self.log_path = f"logs/{self.model_name}/{label}/logs_{self.run_num}.txt"
 		self.log_num = 0
 
-	def log(self, string, debug=True):
+	def log(self, string, stats, debug=True):
 		with open(self.log_path, "a+") as f:
 			if self.log_num == 0: 
-				f.write(f"Model: {self.model_class}, Dir: {self.label}\n")
-				if self.config: f.writelines(" ".join([f"{k}: {v}," for k,v in self.config.items()]) + "\n\n")
+				self.start_time = time.time()
+				f.write(f"Model: {self.model_class}, Dir: {self.label}, Date: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+				if self.config: f.writelines("\n".join([f"{k}: {v}," for k,v in self.config.items()]) + "\n\n")
 				if self.model_src: f.writelines(self.model_src + ["\n"])
 				if self.net_src: f.writelines(self.net_src + ["\n"])
 				if self.trn_src: f.writelines(self.trn_src + ["\n"])
 				f.write("\n")
-			f.write(f"{string}\n")
+			f.write(f"{string} <{time.strftime('%d-%H:%M:%S', time.gmtime(time.time()-self.start_time))}> ({{{', '.join([f'{k}: {np.round(v, 3) if v is not None else v}' for k,v in stats.items()])}}})\n")
 		if debug: print(string)
 		self.log_num += 1
 

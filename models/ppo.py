@@ -1,10 +1,6 @@
-import gym
 import torch
-import pickle
-import argparse
 import numpy as np
-from models.rand import ReplayBuffer, PrioritizedReplayBuffer
-from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, DISCOUNT_RATE, NUM_STEPS, ADVANTAGE_DECAY
+from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS
 
 BATCH_SIZE = 32					# Number of samples to train on for each train step
 PPO_EPOCHS = 2					# Number of iterations to sample batches for training
@@ -14,11 +10,11 @@ CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old
 class PPOActor(torch.nn.Module):
 	def __init__(self, state_size, action_size):
 		super().__init__()
-		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
 		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
 		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
-		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
-		self.action_sig = torch.nn.Parameter(torch.zeros(*action_size))
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.action_sig = torch.nn.Parameter(torch.zeros(action_size[-1]))
 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
 		
 	def forward(self, state, action=None, sample=True):
@@ -36,7 +32,7 @@ class PPOActor(torch.nn.Module):
 class PPOCritic(torch.nn.Module):
 	def __init__(self, state_size, action_size):
 		super().__init__()
-		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
 		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
 		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
 		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
@@ -50,56 +46,50 @@ class PPOCritic(torch.nn.Module):
 		return value
 
 class PPONetwork(PTACNetwork):
-	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
-		super().__init__(state_size, action_size, PPOActor, PPOCritic, lr=lr, gpu=gpu, load=load)
+	def __init__(self, state_size, action_size, actor=PPOActor, critic=PPOCritic, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, actor=actor, critic=critic, lr=lr, gpu=gpu, load=load, name="ppo")
 
-	def get_action_probs(self, state, action_in=None, sample=True, grad=True):
+	def get_action_probs(self, state, action_in=None, grad=False, numpy=False, sample=True):
 		with torch.enable_grad() if grad else torch.no_grad():
 			action, log_prob, entropy = self.actor_local(state.to(self.device), action_in, sample)
-			return action if action_in is None else entropy.mean(), log_prob
+			action_or_entropy = action if action_in is None else entropy.mean()
+			return (x.cpu().numpy() if numpy else x for x in [action_or_entropy, log_prob])
 
-	def get_value(self, state, grad=True):
+	def get_value(self, state, grad=False, numpy=False):
 		with torch.enable_grad() if grad else torch.no_grad():
-			return self.critic_local(state.to(self.device))
+			return self.critic_local(state.to(self.device)).cpu().numpy() if numpy else self.critic_local(state.to(self.device))
 
-	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=torch.scalar_tensor(1), clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
-		values = self.get_value(states)
+	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=torch.tensor(1.0), clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		values = self.get_value(states, grad=True)
 		critic_error = values - targets
 		critic_loss = importances.to(self.device) * critic_error.pow(2) * scale
 		self.step(self.critic_optimizer, critic_loss.mean())
 
-		entropy, new_log_probs = self.get_action_probs(states, actions)
+		entropy, new_log_probs = self.get_action_probs(states, actions, grad=True)
 		ratio = (new_log_probs - old_log_probs).exp()
 		ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
 		actor_loss = -(torch.min(ratio*advantages, ratio_clipped*advantages) + e_weight*entropy) * scale
 		self.step(self.actor_optimizer, actor_loss.mean())
 		return critic_error.cpu().detach().numpy().squeeze(-1)
 
-	def save_model(self, dirname="pytorch", name="best"):
-		super().save_model("ppo", dirname, name)
-		
-	def load_model(self, dirname="pytorch", name="best"):
-		super().load_model("ppo", dirname, name)
-
 class PPOAgent(PTACAgent):
-	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, gpu=True, load=None):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
 		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
 
 	def get_action(self, state, eps=None, sample=True):
 		state = self.to_tensor(state)
-		self.action, self.log_prob = [x.cpu().numpy() for x in self.network.get_action_probs(state, sample=sample, grad=False)]
+		self.action, self.log_prob = self.network.get_action_probs(state, numpy=True, sample=sample)
 		return np.tanh(self.action)
 
 	def train(self, state, action, next_state, reward, done):
 		self.buffer.append((state, self.action, self.log_prob, reward, done))
-		if done[0] or len(self.buffer) >= self.update_freq:
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
 			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
 			self.buffer.clear()
-			next_state = self.to_tensor(next_state)
-			values = self.network.get_value(states, grad=False)
-			next_value = self.network.get_value(next_state, grad=False)
-			targets, advantages = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values, gamma=DISCOUNT_RATE, lamda=ADVANTAGE_DECAY)
-			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states, actions, log_probs, targets, advantages)]
+			states = torch.cat([states, self.to_tensor(next_state).unsqueeze(0)], dim=0)
+			values = self.network.get_value(states)
+			targets, advantages = self.compute_gae(values[-1], rewards.unsqueeze(-1), dones.unsqueeze(-1), values[:-1])
+			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states[:-1], actions, log_probs, targets, advantages)]
 			self.replay_buffer.clear().extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
 			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
 				state, action, log_prob, target, advantage = self.replay_buffer.next_batch(BATCH_SIZE, torch.stack)

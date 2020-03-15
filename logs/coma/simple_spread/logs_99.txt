@@ -1,0 +1,818 @@
+Model: <class 'multiagent.coma.COMAAgent'>, Dir: simple_spread
+num_envs: 16,
+state_size: [(1, 18), (1, 18), (1, 18)],
+action_size: [[1, 5], [1, 5], [1, 5]],
+action_space: [MultiDiscrete([5]), MultiDiscrete([5]), MultiDiscrete([5])],
+envs: <class 'utils.envs.EnsembleEnv'>,
+reward_shape: False,
+icm: False,
+
+import copy
+import torch
+import numpy as np
+from models.rand import MultiagentReplayBuffer3
+from utils.network import PTNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, one_hot_from_indices
+
+LEARNING_RATE = 0.0003
+LAMBDA = 0.95
+DISCOUNT_RATE = 0.99
+GRAD_NORM = 1
+TARGET_UPDATE = 200
+
+HIDDEN_SIZE = 64
+EPS_MAX = 0.5
+EPS_MIN = 0.01
+EPS_DECAY = 0.995
+NUM_ENVS = 4
+EPISODE_LIMIT = 50
+ENTROPY_WEIGHT = 0.001			# The weight for the entropy term of the Actor loss
+MAX_BUFFER_SIZE = 192000		# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32
+
+class PTCNetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, tau=TARGET_UPDATE, gpu=True, load="", name="ptac"): 
+		super().__init__(tau, gpu, name)
+
+	def save_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
+		pass
+		
+	def load_model(self, net="qlearning", dirname="pytorch", name="checkpoint"):
+		pass
+
+class COMAAgent(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, PTCNetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+		self.n_agents = len(action_size)
+		n_actions = action_size[0][-1]
+		n_obs = state_size[0][-1]
+		state_len = int(np.sum([np.prod(space) for space in state_size]))
+		preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=n_actions)])}
+		groups = {"agents": self.n_agents}
+		scheme = {
+			"state": {"vshape": state_len},
+			"obs": {"vshape": n_obs, "group": "agents"},
+			"actions": {"vshape": (1,), "group": "agents", "dtype": torch.long},
+			"reward": {"vshape": (1,)},
+			"done": {"vshape": (1,), "dtype": torch.uint8},
+		}
+		
+		self.device = torch.device('cuda' if gpu and torch.cuda.is_available() else 'cpu')
+		self.replay_buffer = ReplayBuffer(scheme, groups, 2000, EPISODE_LIMIT+1, preprocess=preprocess, device=self.device)
+		self.mac = BasicMAC(self.replay_buffer.scheme, groups, self.n_agents, n_actions, device=self.device)
+		self.learner = COMALearner(self.mac, self.replay_buffer.scheme, self.n_agents, n_actions, device=self.device)
+		self.new_episode_batch = lambda batch_size: EpisodeBatch(scheme, groups, batch_size, EPISODE_LIMIT+1, preprocess=preprocess, device=self.device)
+		self.episode_batch = self.new_episode_batch(NUM_ENVS)
+		self.mac.init_hidden(batch_size=NUM_ENVS)
+		self.num_envs = NUM_ENVS
+		self.time = 0
+		self.replay_buffer2 = MultiagentReplayBuffer3(EPISODE_LIMIT*REPLAY_BATCH_SIZE, state_size, action_size)
+		self.buffer = []
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		self.num_envs = state[0].shape[0] if len(state[0].shape) > len(self.state_size[0]) else 1
+		if np.prod(self.mac.hidden_states.shape[:-1]) != self.num_envs*len(self.action_size): self.mac.init_hidden(batch_size=self.num_envs)
+		if self.episode_batch.batch_size != self.num_envs: self.episode_batch = self.new_episode_batch(self.num_envs)
+		self.step = 0 if not hasattr(self, "step") else (self.step + 1)%self.replay_buffer.max_seq_length
+		state_joint = np.concatenate(state, -1)
+		obs = np.concatenate(state, -2)
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.learner.n_agents), 0), repeats=self.num_envs, axis=0)
+		if not hasattr(self, "action"): self.action = np.zeros([*obs.shape[:-1], self.action_size[0][-1]])
+		inputs = torch.from_numpy(np.concatenate([obs, self.action, agent_ids], -1))
+		self.episode_batch.update({"state": [state_joint], "obs": [obs]}, ts=self.step)
+		actions = self.mac.select_actions(self.episode_batch, inputs, t_ep=self.step, t_env=self.time, test_mode=False)
+		self.action = one_hot_from_indices(actions, self.action_size[0][-1]).cpu().numpy()
+		actions = actions.view([*state[0].shape[:-len(self.state_size[0])], actions.shape[-1]])
+		return np.split(self.action, actions.size(-1), axis=-2)
+
+	def train(self, state, action, next_state, reward, done):
+		actions, rewards, dones = [list(zip(*x)) for x in [action, reward, done]]
+		actions_one_hot = [np.argmax(a, -1) for a in actions]
+		rewards = [np.mean(rewards, -1)]
+		dones = [np.any(dones, -1)]
+		obs = np.concatenate(state, -2)
+		next_obs = np.concatenate(next_state, -2)
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.learner.n_agents), 0), repeats=self.num_envs, axis=0)
+		actor_inputs = torch.from_numpy(np.concatenate([obs, self.action, agent_ids], -1))
+		post_transition_data = {"actions": actions_one_hot, "reward": rewards, "done": dones}
+		self.episode_batch.update(post_transition_data, ts=self.step)
+		self.buffer.append((state, action, reward, done))
+		if np.any(done[0]):
+			states_, actions_, rewards_, dones_ = map(lambda x: [np.stack(t, axis=1) for t in list(zip(*x))], zip(*self.buffer))
+			self.replay_buffer2.add((states_, actions_, rewards_, dones_))
+			self.buffer.clear()
+
+
+
+			state_joint = np.concatenate(state, -1)
+			self.episode_batch.update({"state": [state_joint], "obs": [next_obs]}, ts=self.step)
+			actions = self.mac.select_actions(self.episode_batch, actor_inputs, t_ep=self.step, t_env=self.time, test_mode=False)
+			self.episode_batch.update({"actions": actions}, ts=self.step)
+			self.replay_buffer.insert_episode_batch(self.episode_batch)
+			if self.replay_buffer.can_sample(REPLAY_BATCH_SIZE):
+				episode_sample = self.replay_buffer.sample(REPLAY_BATCH_SIZE)
+				sample = self.replay_buffer2.sample(REPLAY_BATCH_SIZE, torch.Tensor)
+				
+				states_, actions_, rewards_, dones_ = sample
+				states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states_, self.state_size)], dim=-1)
+				actions_one_hot = [one_hot(a) for a in actions_]
+				actions_one_hot_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(actions_one_hot, self.action_size)], dim=-1)
+				last_actions = [torch.cat([torch.zeros_like(a[0:1]), a[:-1]], dim=0) for a in actions_one_hot]
+				last_actions_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(last_actions, self.action_size)], dim=-1)
+				agent_mask = [(1-torch.eye(n_agent)).view(-1, 1).repeat(1, a_size[-1]).view(n_agent, -1) for a_size,n_agent in zip(self.action_size, self.n_agents)]
+				action_mask = torch.ones([1, 1, np.sum(self.n_agents), np.sum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, self.n_agents)])]).to(self.network.device)
+				cols, rows = [0, *np.cumsum(self.n_agents)], [0, *np.cumsum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, self.n_agents)])]
+				for i,mask in enumerate(agent_mask): action_mask[...,cols[i]:cols[i+1], rows[i]:rows[i+1]] = mask
+				
+				self.learner.train(episode_sample, sample)
+			self.episode_batch = self.new_episode_batch(state[0].shape[0])
+			self.mac.init_hidden(self.num_envs)
+			self.time += self.step
+			self.step = 0
+
+class OneHot():
+	def __init__(self, out_dim):
+		self.out_dim = out_dim
+
+	def transform(self, tensor):
+		y_onehot = tensor.new(*tensor.shape[:-1], self.out_dim).zero_()
+		y_onehot.scatter_(-1, tensor.long(), 1)
+		return y_onehot.float()
+
+	def infer_output_info(self, vshape_in, dtype_in):
+		return (self.out_dim,), torch.float32
+
+class COMALearner():
+	def __init__(self, mac, scheme, n_agents, n_actions, device):
+		self.device = device
+		self.n_agents = n_agents
+		self.n_actions = n_actions
+		self.last_target_update_step = 0
+		self.mac = mac
+		self.critic_training_steps = 0
+		self.critic = COMACritic(scheme, self.n_agents, self.n_actions).to(self.device)
+		self.critic_params = list(self.critic.parameters())
+		self.agent_params = list(mac.parameters())
+		self.params = self.agent_params + self.critic_params
+		self.target_critic = copy.deepcopy(self.critic)
+		self.agent_optimiser = torch.optim.Adam(params=self.agent_params, lr=LEARNING_RATE)
+		self.critic_optimiser = torch.optim.Adam(params=self.critic_params, lr=LEARNING_RATE)
+
+	def train(self, batch, sample):
+		bs = batch.batch_size
+		max_t = batch.max_seq_length
+		rewards = batch["reward"][:, :-1]
+		actions = batch["actions"][:, :]
+		done = batch["done"][:, :-1].float()
+		q_vals = self._train_critic(batch, rewards, done, actions, bs, max_t)
+		actions = actions[:,:-1]
+		mac_out = torch.stack([self.mac.forward(batch, None, t) for t in range(actions.shape[1])], dim=1)
+		q_vals = q_vals.reshape(-1, self.n_actions)
+		pi = mac_out.view(-1, self.n_actions)
+		baseline = (pi * q_vals).sum(-1).detach()
+		q_taken = torch.gather(q_vals, dim=1, index=actions.reshape(-1, 1)).squeeze(1)
+		pi_taken = torch.gather(pi, dim=1, index=actions.reshape(-1, 1)).squeeze(1)
+		log_pi_taken = torch.log(pi_taken)
+		advantages = (q_taken - baseline).detach()
+		coma_loss = - (advantages * log_pi_taken).sum()
+		self.agent_optimiser.zero_grad()
+		coma_loss.backward()
+		torch.nn.utils.clip_grad_norm_(self.agent_params, GRAD_NORM)
+		self.agent_optimiser.step()
+		if (self.critic_training_steps - self.last_target_update_step) / TARGET_UPDATE >= 1.0:
+			self._update_targets()
+			self.last_target_update_step = self.critic_training_steps
+
+	def _train_critic(self, batch, rewards, done, actions, bs, max_t):
+		target_q_vals = self.target_critic(batch)[:, :]
+		targets_taken = torch.gather(target_q_vals, dim=3, index=actions).squeeze(3)
+		targets = build_td_lambda_targets(rewards, done, targets_taken, self.n_agents)
+		q_vals = torch.zeros_like(target_q_vals)[:, :-1]
+		for t in reversed(range(rewards.size(1))):
+			q_t = self.critic(batch, t)
+			q_vals[:, t] = q_t.view(bs, self.n_agents, self.n_actions)
+			q_taken = torch.gather(q_t, dim=3, index=actions[:, t:t+1]).squeeze(3).squeeze(1)
+			targets_t = targets[:, t]
+			td_error = (q_taken - targets_t.detach())
+			masked_td_error = td_error
+			loss = (masked_td_error ** 2).sum()
+			self.critic_optimiser.zero_grad()
+			loss.backward()
+			torch.nn.utils.clip_grad_norm_(self.critic_params, GRAD_NORM)
+			self.critic_optimiser.step()
+			self.critic_training_steps += 1
+		return q_vals
+
+	def _update_targets(self):
+		self.target_critic.load_state_dict(self.critic.state_dict())
+
+	def cuda(self):
+		self.mac.cuda()
+		self.critic.cuda()
+		self.target_critic.cuda()
+
+def build_td_lambda_targets(rewards, done, target_qs, n_agents, gamma=DISCOUNT_RATE, td_lambda=LAMBDA):
+	ret = target_qs.new_zeros(*target_qs.shape)
+	ret[:, -1] = target_qs[:, -1] * (1 - torch.sum(done, dim=1))
+	for t in range(ret.shape[1] - 2, -1,  -1):
+		ret[:, t] = td_lambda * gamma * ret[:, t + 1] + (rewards[:, t] + (1 - td_lambda) * gamma * target_qs[:, t + 1] * (1 - done[:, t]))
+	return ret[:, 0:-1]
+
+class COMACritic(torch.nn.Module):
+	def __init__(self, scheme, n_agents, n_actions):
+		super(COMACritic, self).__init__()
+		self.n_actions = n_actions
+		self.n_agents = n_agents
+		input_shape = self._get_input_shape(scheme)
+		self.output_type = "q"
+		self.fc1 = torch.nn.Linear(input_shape, HIDDEN_SIZE)
+		self.fc2 = torch.nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+		self.fc3 = torch.nn.Linear(HIDDEN_SIZE, self.n_actions)
+
+	def forward(self, batch, t=None):
+		inputs = self._build_inputs(batch, t=t)
+		x = torch.relu(self.fc1(inputs))
+		x = torch.relu(self.fc2(x))
+		q = self.fc3(x)
+		return q
+
+	def _build_inputs(self, batch, t=None):
+		bs = batch.batch_size
+		max_t = batch.max_seq_length if t is None else 1
+		ts = slice(None) if t is None else slice(t, t+1)
+		inputs = []
+		inputs.append(batch["state"][:, ts].unsqueeze(2).repeat(1, 1, self.n_agents, 1))
+		inputs.append(batch["obs"][:, ts])
+		actions = batch["actions_onehot"][:, ts].view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
+		agent_mask = (1 - torch.eye(self.n_agents, device=batch.device))
+		agent_mask = agent_mask.view(-1, 1).repeat(1, self.n_actions).view(self.n_agents, -1)
+		inputs.append(actions * agent_mask.unsqueeze(0).unsqueeze(0))
+		# last actions
+		if t == 0:
+			inputs.append(torch.zeros_like(batch["actions_onehot"][:, 0:1]).view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1))
+		elif isinstance(t, int):
+			inputs.append(batch["actions_onehot"][:, slice(t-1, t)].view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1))
+		else:
+			last_actions = torch.cat([torch.zeros_like(batch["actions_onehot"][:, 0:1]), batch["actions_onehot"][:, :-1]], dim=1)
+			last_actions = last_actions.view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
+			inputs.append(last_actions)
+
+		inputs.append(torch.eye(self.n_agents, device=batch.device).unsqueeze(0).unsqueeze(0).expand(bs, max_t, -1, -1))
+		inputs = torch.cat([x.reshape(bs, max_t, self.n_agents, -1) for x in inputs], dim=-1)
+		return inputs
+
+	def _get_input_shape(self, scheme):
+		input_shape = scheme["state"]["vshape"]
+		input_shape += scheme["obs"]["vshape"]
+		input_shape += scheme["actions_onehot"]["vshape"][0] * self.n_agents * 2
+		input_shape += self.n_agents
+		return input_shape
+
+class BasicMAC:
+	def __init__(self, scheme, groups, n_agents, n_actions, device):
+		self.device = device
+		self.n_agents = n_agents
+		self.n_actions = n_actions
+		self.agent = RNNAgent(self._get_input_shape(scheme), self.n_actions).to(self.device)
+		self.action_selector = MultinomialActionSelector()
+		self.hidden_states = None
+
+	def select_actions(self, ep_batch, inputs, t_ep, t_env, bs=slice(None), test_mode=False):
+		agent_outputs = self.forward(ep_batch, inputs, t_ep, test_mode=test_mode)
+		chosen_actions = self.action_selector.select_action(agent_outputs[bs], t_env, test_mode=test_mode)
+		return chosen_actions
+
+	def forward(self, ep_batch, inputs, t, test_mode=False):
+		agent_inputs = self._build_inputs(ep_batch, t)
+		agent_outs = self.agent(agent_inputs, self.hidden_states)
+		agent_outs = torch.nn.functional.softmax(agent_outs, dim=-1)
+		if not test_mode:
+			epsilon_action_num = agent_outs.size(-1)
+			agent_outs = ((1 - self.action_selector.epsilon) * agent_outs + torch.ones_like(agent_outs).to(self.device) * self.action_selector.epsilon/epsilon_action_num)
+		return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
+
+	def init_hidden(self, batch_size):
+		self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
+
+	def parameters(self):
+		return self.agent.parameters()
+
+	def _build_inputs(self, batch, t):
+		bs = batch.batch_size
+		inputs = []
+		inputs.append(batch["obs"][:, t])  # b1av
+		inputs.append(torch.zeros_like(batch["actions_onehot"][:, t]) if t==0 else batch["actions_onehot"][:, t-1])
+		inputs.append(torch.eye(self.n_agents, device=batch.device).unsqueeze(0).expand(bs, -1, -1))
+		inputs = torch.cat([x.reshape(bs, self.n_agents, -1) for x in inputs], dim=-1)
+		return inputs
+
+	def _get_input_shape(self, scheme):
+		input_shape = scheme["obs"]["vshape"]
+		input_shape += scheme["actions_onehot"]["vshape"][0]
+		input_shape += self.n_agents
+		return input_shape
+
+class RNNAgent(torch.nn.Module):
+	def __init__(self, input_shape, output_shape):
+		super(RNNAgent, self).__init__()
+		self.fc1 = torch.nn.Linear(input_shape, HIDDEN_SIZE)
+		self.fc3 = torch.nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+		self.fc2 = torch.nn.Linear(HIDDEN_SIZE, output_shape)
+
+	def init_hidden(self):
+		return self.fc1.weight.new(1, HIDDEN_SIZE).zero_()
+
+	def forward(self, inputs, hidden_state):
+		x = torch.relu(self.fc1(inputs))
+		x = self.fc3(x).relu()
+		q = self.fc2(x)
+		return q
+
+class MultinomialActionSelector():
+	def __init__(self, eps_start=EPS_MAX, eps_finish=EPS_MIN, eps_decay=EPS_DECAY):
+		self.schedule = DecayThenFlatSchedule(eps_start, eps_finish, EPISODE_LIMIT/(1-eps_decay), decay="linear")
+		self.epsilon = self.schedule.eval(0)
+
+	def select_action(self, agent_inputs, t_env, test_mode=False):
+		self.epsilon = self.schedule.eval(t_env)
+		masked_policies = agent_inputs.clone()
+		picked_actions = masked_policies.max(dim=2)[1] if test_mode else torch.distributions.Categorical(masked_policies).sample().long()
+		return picked_actions
+
+class DecayThenFlatSchedule():
+	def __init__(self, start, finish, time_length, decay="exp"):
+		self.start = start
+		self.finish = finish
+		self.time_length = time_length
+		self.delta = (self.start - self.finish) / self.time_length
+		self.decay = decay
+		if self.decay in ["exp"]:
+			self.exp_scaling = (-1) * self.time_length / np.log(self.finish) if self.finish > 0 else 1
+
+	def eval(self, T):
+		if self.decay in ["linear"]:
+			return max(self.finish, self.start - self.delta * T)
+		elif self.decay in ["exp"]:
+			return min(self.start, max(self.finish, np.exp(- T / self.exp_scaling)))
+
+from types import SimpleNamespace as SN
+
+class EpisodeBatch():
+	def __init__(self, scheme, groups, batch_size, max_seq_length, data=None, preprocess=None, device="cpu"):
+		self.scheme = scheme.copy()
+		self.groups = groups
+		self.batch_size = batch_size
+		self.max_seq_length = max_seq_length
+		self.preprocess = {} if preprocess is None else preprocess
+		self.device = device
+
+		if data is not None:
+			self.data = data
+		else:
+			self.data = SN()
+			self.data.transition_data = {}
+			self.data.episode_data = {}
+			self._setup_data(self.scheme, self.groups, batch_size, max_seq_length, self.preprocess)
+
+	def _setup_data(self, scheme, groups, batch_size, max_seq_length, preprocess):
+		if preprocess is not None:
+			for k in preprocess:
+				assert k in scheme
+				new_k = preprocess[k][0]
+				transforms = preprocess[k][1]
+				vshape = self.scheme[k]["vshape"]
+				dtype = self.scheme[k]["dtype"]
+				for transform in transforms:
+					vshape, dtype = transform.infer_output_info(vshape, dtype)
+				self.scheme[new_k] = {"vshape": vshape, "dtype": dtype}
+				if "group" in self.scheme[k]:
+					self.scheme[new_k]["group"] = self.scheme[k]["group"]
+				if "episode_const" in self.scheme[k]:
+					self.scheme[new_k]["episode_const"] = self.scheme[k]["episode_const"]
+
+		assert "filled" not in scheme, '"filled" is a reserved key for masking.'
+		scheme.update({"filled": {"vshape": (1,), "dtype": torch.long},})
+
+		for field_key, field_info in scheme.items():
+			assert "vshape" in field_info, "Scheme must define vshape for {}".format(field_key)
+			vshape = field_info["vshape"]
+			episode_const = field_info.get("episode_const", False)
+			group = field_info.get("group", None)
+			dtype = field_info.get("dtype", torch.float32)
+
+			if isinstance(vshape, int):
+				vshape = (vshape,)
+			if group:
+				assert group in groups, "Group {} must have its number of members defined in _groups_".format(group)
+				shape = (groups[group], *vshape)
+			else:
+				shape = vshape
+			if episode_const:
+				self.data.episode_data[field_key] = torch.zeros((batch_size, *shape), dtype=dtype).to(self.device)
+			else:
+				self.data.transition_data[field_key] = torch.zeros((batch_size, max_seq_length, *shape), dtype=dtype).to(self.device)
+
+	def extend(self, scheme, groups=None):
+		self._setup_data(scheme, self.groups if groups is None else groups, self.batch_size, self.max_seq_length)
+
+	def to(self, device):
+		for k, v in self.data.transition_data.items():
+			self.data.transition_data[k] = v.to(device)
+		for k, v in self.data.episode_data.items():
+			self.data.episode_data[k] = v.to(device)
+		self.device = device
+
+	def update(self, data, bs=slice(None), ts=slice(None), mark_filled=True):
+		slices = self._parse_slices((bs, ts))
+		for k, v in data.items():
+			if k in self.data.transition_data:
+				target = self.data.transition_data
+				if mark_filled:
+					target["filled"][slices] = 1
+					mark_filled = False
+				_slices = slices
+			elif k in self.data.episode_data:
+				target = self.data.episode_data
+				_slices = slices[0]
+			else:
+				raise KeyError("{} not found in transition or episode data".format(k))
+
+			dtype = self.scheme[k].get("dtype", torch.float32)
+			v = v if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=dtype, device=self.device)
+			self._check_safe_view(v, target[k][_slices])
+			target[k][_slices] = v.view_as(target[k][_slices])
+
+			if k in self.preprocess:
+				new_k = self.preprocess[k][0]
+				v = target[k][_slices]
+				for transform in self.preprocess[k][1]:
+					v = transform.transform(v)
+				target[new_k][_slices] = v.view_as(target[new_k][_slices])
+
+	def _check_safe_view(self, v, dest):
+		idx = len(v.shape) - 1
+		for s in dest.shape[::-1]:
+			if v.shape[idx] != s:
+				if s != 1:
+					raise ValueError("Unsafe reshape of {} to {}".format(v.shape, dest.shape))
+			else:
+				idx -= 1
+
+	def __getitem__(self, item):
+		if isinstance(item, str):
+			if item in self.data.episode_data:
+				return self.data.episode_data[item]
+			elif item in self.data.transition_data:
+				return self.data.transition_data[item]
+			else:
+				raise ValueError
+		elif isinstance(item, tuple) and all([isinstance(it, str) for it in item]):
+			new_data = self._new_data_sn()
+			for key in item:
+				if key in self.data.transition_data:
+					new_data.transition_data[key] = self.data.transition_data[key]
+				elif key in self.data.episode_data:
+					new_data.episode_data[key] = self.data.episode_data[key]
+				else:
+					raise KeyError("Unrecognised key {}".format(key))
+
+			# Update the scheme to only have the requested keys
+			new_scheme = {key: self.scheme[key] for key in item}
+			new_groups = {self.scheme[key]["group"]: self.groups[self.scheme[key]["group"]]
+						for key in item if "group" in self.scheme[key]}
+			ret = EpisodeBatch(new_scheme, new_groups, self.batch_size, self.max_seq_length, data=new_data, device=self.device)
+			return ret
+		else:
+			item = self._parse_slices(item)
+			new_data = self._new_data_sn()
+			for k, v in self.data.transition_data.items():
+				new_data.transition_data[k] = v[item]
+			for k, v in self.data.episode_data.items():
+				new_data.episode_data[k] = v[item[0]]
+
+			ret_bs = self._get_num_items(item[0], self.batch_size)
+			ret_max_t = self._get_num_items(item[1], self.max_seq_length)
+
+			ret = EpisodeBatch(self.scheme, self.groups, ret_bs, ret_max_t, data=new_data, device=self.device)
+			return ret
+
+	def _get_num_items(self, indexing_item, max_size):
+		if isinstance(indexing_item, list) or isinstance(indexing_item, np.ndarray):
+			return len(indexing_item)
+		elif isinstance(indexing_item, slice):
+			_range = indexing_item.indices(max_size)
+			return 1 + (_range[1] - _range[0] - 1)//_range[2]
+
+	def _new_data_sn(self):
+		new_data = SN()
+		new_data.transition_data = {}
+		new_data.episode_data = {}
+		return new_data
+
+	def _parse_slices(self, items):
+		parsed = []
+		# Only batch slice given, add full time slice
+		if (isinstance(items, slice)  # slice a:b
+			or isinstance(items, int)  # int i
+			or (isinstance(items, (list, np.ndarray, torch.LongTensor, torch.cuda.LongTensor)))  # [a,b,c]
+			):
+			items = (items, slice(None))
+
+		# Need the time indexing to be contiguous
+		if isinstance(items[1], list):
+			raise IndexError("Indexing across Time must be contiguous")
+
+		for item in items:
+			#TODO: stronger checks to ensure only supported options get through
+			if isinstance(item, int):
+				# Convert single indices to slices
+				parsed.append(slice(item, item+1))
+			else:
+				# Leave slices and lists as is
+				parsed.append(item)
+		return parsed
+
+	def max_t_filled(self):
+		return torch.sum(self.data.transition_data["filled"], 1).max(0)[0]
+
+class ReplayBuffer(EpisodeBatch):
+	def __init__(self, scheme, groups, buffer_size, max_seq_length, preprocess=None, device="cpu"):
+		super(ReplayBuffer, self).__init__(scheme, groups, buffer_size, max_seq_length, preprocess=preprocess, device=device)
+		self.buffer_size = buffer_size  # same as self.batch_size but more explicit
+		self.buffer_index = 0
+		self.episodes_in_buffer = 0
+
+	def insert_episode_batch(self, ep_batch):
+		if self.buffer_index + ep_batch.batch_size <= self.buffer_size:
+			self.update(ep_batch.data.transition_data, slice(self.buffer_index, self.buffer_index + ep_batch.batch_size), slice(0, ep_batch.max_seq_length), mark_filled=False)
+			self.update(ep_batch.data.episode_data, slice(self.buffer_index, self.buffer_index + ep_batch.batch_size))
+			self.buffer_index = (self.buffer_index + ep_batch.batch_size)
+			self.episodes_in_buffer = max(self.episodes_in_buffer, self.buffer_index)
+			self.buffer_index = self.buffer_index % self.buffer_size
+			assert self.buffer_index < self.buffer_size
+		else:
+			buffer_left = self.buffer_size - self.buffer_index
+			self.insert_episode_batch(ep_batch[0:buffer_left, :])
+			self.insert_episode_batch(ep_batch[buffer_left:, :])
+
+	def can_sample(self, batch_size):
+		return self.episodes_in_buffer >= batch_size
+
+	def sample(self, batch_size):
+		assert self.can_sample(batch_size)
+		if self.episodes_in_buffer == batch_size:
+			return self[:batch_size]
+		else:
+			ep_ids = np.random.choice(self.episodes_in_buffer, batch_size, replace=False)
+			return self[ep_ids]
+
+
+import torch
+import random
+import numpy as np
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, one_hot, gsoftmax
+
+EPS_DECAY = 0.995             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+INPUT_LAYER = 64
+ACTOR_HIDDEN = 64
+CRITIC_HIDDEN = 64
+
+# class COMAActor(torch.nn.Module):
+# 	def __init__(self, state_size, action_size):
+# 		super().__init__()
+# 		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+# 		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+# 		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+# 		self.action_probs = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+# 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+# 		self.init_hidden()
+
+# 	def forward(self, state, sample=True):
+# 		state = self.layer1(state).relu()
+# 		state = self.layer2(state).relu()
+# 		state = self.layer3(state).relu()
+# 		action_probs = self.action_probs(state).softmax(-1)
+# 		dist = torch.distributions.Categorical(action_probs)
+# 		action_in = dist.sample()
+# 		action = one_hot_from_indices(action_in, action_probs.size(-1))
+# 		entropy = dist.entropy()
+# 		return action, action_probs, entropy
+
+# 	def init_hidden(self, batch_size=1):
+# 		self.hidden = torch.zeros([batch_size, ACTOR_HIDDEN])
+
+# class COMACritic(torch.nn.Module):
+# 	def __init__(self, state_size, action_size):
+# 		super().__init__()
+# 		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+# 		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+# 		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+# 		self.q_values = torch.nn.Linear(CRITIC_HIDDEN, action_size[-1])
+# 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+# 	def forward(self, state):
+# 		state = self.layer1(state).relu()
+# 		state = self.layer2(state).relu()
+# 		state = self.layer3(state).relu()
+# 		q_values = self.q_values(state)
+# 		return q_values
+
+class COMANetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(gpu=gpu)
+		self.state_size = [state_size] if type(state_size[0]) in [int, np.int32] else state_size
+		self.action_size = [action_size] if type(action_size[0]) in [int, np.int32] else action_size
+		self.n_agents = lambda size: 1 if len(size)==1 else size[0]
+		make_actor = lambda s,a: COMAActor([s[-1] + a[-1] + self.n_agents(s)], a)
+		make_critic = lambda s,a: COMACritic([np.sum([np.prod(s) for s in self.state_size]) + 2*np.sum([np.prod(a) for a in self.action_size]) + s[-1] + self.n_agents(s)], a)
+		self.models = [PTACNetwork(s_size, a_size, make_actor, make_critic, lr=lr, gpu=gpu, load=load) for s_size,a_size in zip(self.state_size, self.action_size)]
+		if load: self.load_model(load)
+		
+	def get_action_probs(self, state, sample=True, grad=True, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, action_prob, entropy = map(list, zip(*[model.actor_local(s, sample) for s,model in zip(state, self.models)]))
+			return [[a.cpu().numpy().astype(np.float32) for a in x] for x in [action, action_prob, entropy]] if numpy else (action, action_prob, entropy)
+
+	def get_value(self, state, use_target=False, grad=True, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			q_values = [model.critic_local(s) if use_target else model.critic_target(s) for s,model in zip(state, self.models)]
+			return [q.cpu().numpy() for q in q_values] if numpy else q_values
+
+	def optimize(self, actions, actor_inputs, critic_inputs, q_values, q_targets):
+		for model,action,actor_input,critic_input,q_value,q_target in zip(self.models, actions, actor_inputs, critic_inputs, q_values, q_targets):
+			q_value = model.critic_local(critic_input)
+			q_select = torch.gather(q_value, dim=-1, index=action.argmax(-1, keepdims=True)).squeeze(-1)
+			critic_loss = (q_select - q_target.detach()).pow(2)
+			model.step(model.critic_optimizer, critic_loss.mean(), model.critic_local.parameters())
+			model.soft_copy(model.critic_local, model.critic_target)
+
+			_, action_probs, entropy = model.actor_local(actor_input)
+			baseline = (action_probs * q_value).sum(-1, keepdims=True).detach()
+			q_selected = torch.gather(q_value, dim=-1, index=action.argmax(-1, keepdims=True))
+			log_probs = torch.gather(action_probs, dim=-1, index=action.argmax(-1, keepdims=True)).log()
+			advantages = (q_selected - baseline).detach()
+			actor_loss = -((advantages * log_probs).sum() + ENTROPY_WEIGHT*entropy.mean())
+			model.step(model.actor_optimizer, actor_loss.mean(), model.actor_local.parameters())
+
+	def save_model(self, dirname="pytorch", name="best"):
+		[model.save_model("coma", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		[model.load_model("coma", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+class COMAAgent2(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, COMANetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+		self.replay_buffer = MultiagentReplayBuffer3(MAX_BUFFER_SIZE, state_size, action_size)
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		self.step = 0 if not hasattr(self, "step") else self.step + 1
+		eps = self.eps if eps is None else eps
+		action_random = super().get_action(state)
+		if not hasattr(self, "action"): self.action = [np.zeros_like(a) for a in action_random]
+		actor_inputs = []
+		state_list = state
+		state_list = [state_list] if type(state_list) != list else state_list
+		for i,(state,last_a,s_size,a_size) in enumerate(zip(state_list, self.action, self.state_size, self.action_size)):
+			n_agents = self.network.n_agents(s_size)
+			last_action = last_a if len(state.shape)-len(s_size) == len(last_a.shape)-len(a_size) else np.zeros_like(action_random[i])
+			agent_ids = np.eye(n_agents) if len(state.shape)==len(s_size) else np.repeat(np.expand_dims(np.eye(n_agents), 0), repeats=state.shape[0], axis=0)
+			actor_input = self.to_tensor(np.concatenate([state, last_action, agent_ids], axis=-1))
+			actor_inputs.append(actor_input)
+		action = self.network.get_action_probs(actor_inputs, sample=sample, grad=False, numpy=numpy)[0]
+		if numpy: self.action = action
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, reward, done))
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			n_agents = [self.network.n_agents(a_size) for a_size in self.action_size]
+			states = [torch.cat([s, ns.unsqueeze(0)], dim=0) for s,ns in zip(states, self.to_tensor(next_state))]
+			actions = [torch.cat([a, na.unsqueeze(0)], dim=0) for a,na in zip(actions, self.get_action(next_state, numpy=False))]
+			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+			actions_one_hot = [one_hot(a) for a in actions]
+			actions_one_hot_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(actions_one_hot, self.action_size)], dim=-1)
+			last_actions = [torch.cat([torch.zeros_like(a[0:1]), a[:-1]], dim=0) for a in actions_one_hot]
+			last_actions_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(last_actions, self.action_size)], dim=-1)
+			agent_mask = [(1-torch.eye(n_agent)).view(-1, 1).repeat(1, a_size[-1]).view(n_agent, -1) for a_size,n_agent in zip(self.action_size, n_agents)]
+			action_mask = torch.ones([1, 1, np.sum(n_agents), np.sum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, n_agents)])]).to(self.network.device)
+			cols, rows = [0, *np.cumsum(n_agents)], [0, *np.cumsum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, n_agents)])]
+			for i,mask in enumerate(agent_mask): action_mask[...,cols[i]:cols[i+1], rows[i]:rows[i+1]] = mask
+
+			states_joint, actions_joint, last_actions_joint = [x.unsqueeze(-2).repeat_interleave(action_mask.shape[-2], dim=-2) for x in [states_joint, actions_one_hot_joint, last_actions_joint]]
+			joint_inputs = torch.cat([states_joint, actions_joint * action_mask, last_actions_joint], dim=-1).split(n_agents, dim=-2)
+			agent_ids = [torch.eye(self.network.n_agents(a_size)).unsqueeze(0).unsqueeze(0).expand(*a.shape[:2], -1, -1).to(self.network.device) for a_size, a in zip(self.action_size, actions)]
+			critic_inputs = [torch.cat([joint_input, state, agent_id], dim=-1) for joint_input,state,agent_id in zip(joint_inputs, states, agent_ids)]
+			actor_inputs = [torch.cat([state, last_action, agent_id], dim=-1) for state,last_action,agent_id in zip(states, last_actions, agent_ids)]
+
+			q_values = self.network.get_value(critic_inputs, use_target=True, grad=False)
+			q_selecteds = [torch.gather(q_value, dim=-1, index=a.argmax(-1, keepdims=True)).squeeze(-1) for q_value,a in zip(q_values,actions)]
+			q_targets = [self.compute_gae(q_selected[-1], reward.unsqueeze(-1), done.unsqueeze(-1), q_selected[:-1])[0] for q_selected,reward,done in zip(q_selecteds, rewards, dones)]
+			actions, actor_inputs, critic_inputs, q_values = [[t[:-1] for t in x] for x in [actions, actor_inputs, critic_inputs, q_values]]
+			actions, actor_inputs, critic_inputs, q_values, q_targets = [[t.reshape(-1, *t.shape[2:]).cpu().numpy() for t in x] for x in [actions, actor_inputs, critic_inputs, q_values, q_targets]]
+			self.replay_buffer.add((actions, actor_inputs, critic_inputs, q_values, q_targets))
+		if len(self.replay_buffer) >= REPLAY_BATCH_SIZE and self.step%self.update_freq == 0:
+			actions, actor_inputs, critic_inputs, q_values, q_targets = self.replay_buffer.sample(REPLAY_BATCH_SIZE, cast=self.to_tensor)
+			self.network.optimize(actions, actor_inputs, critic_inputs, q_values, q_targets)
+			if np.any(done[0]): self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0003           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 256				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 512				# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.998			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.001               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 1000000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+# import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.sac import SACAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-3]
+env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False, reward_shape=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward: [(ballr(o[0,88], o[0,89]) + o[0,95]-o[0,96] + 2*r)/4 for o,r in zip(obs,reward)]
+	return FootballTeamEnv(ggym, env_name, reward_fn if reward_shape else None)
+
+def run(model, steps=10000, ports=16, env_name=env_name, trial_at=100, save_at=10, checkpoint=True, save_best=False, log=True, render=False, reward_shape=False, icm=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name, reward_shape=reward_shape), ports)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=icm) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), reward_shape=reward_shape, icm=icm)
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})", agent.get_stats())
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}", agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {np.mean([rollout(envs.env, agent, eps=0.0, render=True) for _ in range(5)], axis=0)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="coma", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=200000, help="Number of steps to train the agent")
+	parser.add_argument("--reward_shape", action="store_true", help="Whether to shape rewards for football")
+	parser.add_argument("--icm", action="store_true", help="Whether to use intrinsic motivation")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.trial:
+		trial(model=model, env_name=env_name, render=args.render)
+	elif args.selfport is not None or MPI_RANK>0 :
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	else:
+		run(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)
+
+
+Step:       0, Reward: [-456.777 -456.777 -456.777] [89.748], Avg: [-456.777 -456.777 -456.777] (1.0000) ({r_i: None, r_t: [-7.838 -7.838 -7.838], eps: 1.0})

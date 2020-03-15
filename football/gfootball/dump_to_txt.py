@@ -12,37 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Script converting dump file to human readable format.
 
    Example usage:
    python dump_to_txt.py --dump=/tmp/input.dump --output=/tmp/output.txt
-
 """
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from gfootball.env import script_helpers
-
 from absl import app
 from absl import flags
+from football.gfootball.env import script_helpers
 
 FLAGS = flags.FLAGS
-
 flags.DEFINE_string('trace_file', None, 'Trace file to convert')
 flags.DEFINE_string('output', None, 'Output txt file')
-flags.DEFINE_bool('include_debug', True,
-                  'Include debug information for each step')
+flags.DEFINE_bool('include_debug', True, 'Include debug information for each step')
 flags.mark_flag_as_required('trace_file')
 flags.mark_flag_as_required('output')
 
-
 def main(_):
-  script_helpers.ScriptHelpers().dump_to_txt(FLAGS.trace_file, FLAGS.output,
-                                             FLAGS.include_debug)
-
+  	script_helpers.ScriptHelpers().dump_to_txt(FLAGS.trace_file, FLAGS.output, FLAGS.include_debug)
 
 if __name__ == '__main__':
-  app.run(main)
+  	app.run(main)

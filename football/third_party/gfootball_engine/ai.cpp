@@ -142,8 +142,7 @@ BOOST_PYTHON_MODULE(_gameplayfootball) {
       .def_readwrite("config", &GameEnv_Python::scenario_config)
       .def_readwrite("game_config", &GameEnv_Python::game_config)
       .def_readwrite("state", &GameEnv_Python::state)
-      .def_readwrite("waiting_for_game_count",
-                     &GameEnv_Python::waiting_for_game_count)
+      .def_readwrite("waiting_for_game_count", &GameEnv_Python::waiting_for_game_count)
       .def("tracker_setup", &GameEnv::tracker_setup);
 
   class_<Vector3>("Vector3", init<float, float, float>())
@@ -153,11 +152,9 @@ BOOST_PYTHON_MODULE(_gameplayfootball) {
 
   class_<GameConfig>("GameConfig")
       .def_readwrite("render", &GameConfig::render)
-      .def_readwrite("physics_steps_per_frame",
-                     &GameConfig::physics_steps_per_frame);
+      .def_readwrite("physics_steps_per_frame", &GameConfig::physics_steps_per_frame);
 
-  class_<ScenarioConfig, SHARED_PTR<ScenarioConfig>, boost::noncopyable>(
-      "ScenarioConfig", no_init)
+  class_<ScenarioConfig, SHARED_PTR<ScenarioConfig>, boost::noncopyable>("ScenarioConfig", no_init)
       .def("make", &ScenarioConfig::make)
       .staticmethod("make")
       .def_readwrite("ball_position", &ScenarioConfig::ball_position)
@@ -166,30 +163,21 @@ BOOST_PYTHON_MODULE(_gameplayfootball) {
       .def_readwrite("left_agents", &ScenarioConfig::left_agents)
       .def_readwrite("right_agents", &ScenarioConfig::right_agents)
       .def_readwrite("use_magnet", &ScenarioConfig::use_magnet)
-      .def_readwrite("game_engine_random_seed",
-                     &ScenarioConfig::game_engine_random_seed)
-      .def_readwrite("reverse_team_processing",
-                     &ScenarioConfig::reverse_team_processing)
+      .def_readwrite("game_engine_random_seed", &ScenarioConfig::game_engine_random_seed)
+      .def_readwrite("reverse_team_processing", &ScenarioConfig::reverse_team_processing)
       .def_readwrite("offsides", &ScenarioConfig::offsides)
       .def_readwrite("real_time", &ScenarioConfig::real_time)
-      .def_readwrite("left_team_difficulty",
-                     &ScenarioConfig::left_team_difficulty)
-      .def_readwrite("right_team_difficulty",
-                     &ScenarioConfig::right_team_difficulty)
+      .def_readwrite("left_team_difficulty", &ScenarioConfig::left_team_difficulty)
+      .def_readwrite("right_team_difficulty", &ScenarioConfig::right_team_difficulty)
       .def_readwrite("deterministic", &ScenarioConfig::deterministic)
-      .def_readwrite("end_episode_on_score",
-                     &ScenarioConfig::end_episode_on_score)
-      .def_readwrite("end_episode_on_possession_change",
-                     &ScenarioConfig::end_episode_on_possession_change)
-      .def_readwrite("end_episode_on_out_of_play",
-                     &ScenarioConfig::end_episode_on_out_of_play)
+      .def_readwrite("end_episode_on_score", &ScenarioConfig::end_episode_on_score)
+      .def_readwrite("end_episode_on_possession_change", &ScenarioConfig::end_episode_on_possession_change)
+      .def_readwrite("end_episode_on_out_of_play", &ScenarioConfig::end_episode_on_out_of_play)
       .def_readwrite("game_duration", &ScenarioConfig::game_duration);
 
-  class_<std::vector<FormationEntry> >("FormationEntryVec").def(
-      vector_indexing_suite<std::vector<FormationEntry> >());
+  class_<std::vector<FormationEntry> >("FormationEntryVec").def(vector_indexing_suite<std::vector<FormationEntry> >());
 
-  class_<FormationEntry>("FormationEntry",
-                         init<float, float, e_PlayerRole, bool, bool>())
+  class_<FormationEntry>("FormationEntry", init<float, float, e_PlayerRole, bool, bool>())
       .def_readonly("role", &FormationEntry::role)
       .add_property("position", &FormationEntry::position_env)
       .def_readwrite("lazy", &FormationEntry::lazy)

@@ -1,0 +1,94 @@
+Model: <class 'multiagent.mappo.MAPPOAgent'>, Dir: simple_tag
+num_envs: 16, state_size: [(3, 16), (14,)], action_size: [[3, 5], [5]], action_space: [<gym.spaces.multi_discrete.MultiDiscrete object at 0x7fa12a777ba8>, Discrete(5)],
+
+import torch
+import random
+import numpy as np
+from models.ppo import PPOActor, PPOCritic, PPONetwork
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, REG_LAMBDA, EPS_MIN
+
+ENTROPY_WEIGHT = 0.005			# The weight for the entropy term of the Actor loss
+CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old probabilities
+
+class MAPPONetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(gpu=gpu)
+		self.state_size = state_size
+		self.action_size = action_size
+		self.critic = PPOCritic([np.sum([np.prod(s) for s in state_size])], [np.sum([np.prod(a) for a in action_size])])
+		self.models = [PPONetwork(s_size, a_size, PPOActor, lambda s,a: self.critic, lr=lr, gpu=gpu, load=load) for s_size,a_size in zip(state_size, action_size)]
+		
+	def get_action_probs(self, state, action_in=None, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action_in = [None] * len(state) if action_in is None else action_in
+			action_or_entropy, log_prob = map(list, zip(*[model.get_action_probs(s, a, grad=grad, numpy=numpy, sample=sample) for s,a,model in zip(state, action_in, self.models)]))
+			return action_or_entropy, log_prob
+
+	def get_value(self, state, grad=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			q_value = [model.get_value(state, grad) for model in self.models]
+			return q_value
+
+	def optimize(self, states, actions, old_log_probs, states_joint, targets, advantages, clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		for model, state, action, old_log_prob, target, advantage in zip(self.models, states, actions, old_log_probs, targets, advantages):
+			values = model.get_value(states_joint[:-1], grad=True)
+			critic_error = values - target.detach()
+			critic_loss = critic_error.pow(2)
+			model.step(model.critic_optimizer, critic_loss.mean())
+			model.soft_copy(model.critic_local, model.critic_target)
+
+			entropy, new_log_prob = model.get_action_probs(state[:-1], action, grad=True, numpy=False)
+			ratio = (new_log_prob - old_log_prob).exp()
+			ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+			advantage = advantage.view(*advantage.shape, *[1]*(len(ratio.shape)-len(advantage.shape)))
+			actor_loss = -(torch.min(ratio*advantage, ratio_clipped*advantage) + e_weight*entropy) * scale
+			model.step(model.actor_optimizer, actor_loss.mean())
+			model.soft_copy(model.actor_local, model.actor_target)
+
+	def save_model(self, dirname="pytorch", name="best"):
+		[model.save_model("mappo", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		[model.load_model("mappo", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+class MAPPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
+		super().__init__(state_size, action_size, MAPPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		action, self.log_prob = self.network.get_action_probs(self.to_tensor(state, int(type(state) != list)), numpy=True, sample=sample)
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, np.array(list(zip(*self.log_prob))), reward, done))
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+			states, actions, log_probs, rewards, dones = map(lambda x: self.to_tensor(x,2), zip(*self.buffer))
+			self.buffer.clear()
+			states = [torch.cat([s, ns.unsqueeze(0)], dim=0) for s,ns in zip(states, self.to_tensor(next_state, 1))]
+			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+			values = self.network.get_value(states_joint)
+			targets, advantages = zip(*[self.compute_gae(value[-1], reward.unsqueeze(-1), done.unsqueeze(-1), value[:-1]) for value,reward,done in zip(values, rewards, dones)])
+			self.network.optimize(states, actions, log_probs, states_joint, targets, advantages)
+
+
+Step: 49, Reward: [  0.    -38.948] [19.4740], Avg: [  0.    -38.948] (1.000)
+Step: 99, Reward: [  0.    -50.433] [25.2167], Avg: [  0.    -44.691] (1.000)
+Step: 149, Reward: [0. 0.] [0.0000], Avg: [  0.    -29.794] (1.000)
+Step: 199, Reward: [ 20.    -91.639] [55.8195], Avg: [  5.    -45.255] (1.000)
+Step: 249, Reward: [0. 0.] [0.0000], Avg: [  4.    -36.204] (1.000)
+Step: 299, Reward: [0. 0.] [0.0000], Avg: [  3.333 -30.17 ] (1.000)
+Step: 349, Reward: [   0.    -126.477] [63.2384], Avg: [  2.857 -43.928] (1.000)
+Step: 399, Reward: [ 10.    -86.098] [48.0492], Avg: [  3.75  -49.199] (1.000)
+Step: 449, Reward: [  0.    -12.617] [6.3085], Avg: [  3.333 -45.135] (1.000)
+Step: 499, Reward: [0. 0.] [0.0000], Avg: [  3.    -40.621] (1.000)
+Step: 549, Reward: [ 10.    -18.228] [14.1142], Avg: [  3.636 -38.586] (1.000)
+Step: 599, Reward: [ 0.    -3.673] [1.8366], Avg: [  3.333 -35.676] (1.000)
+Step: 649, Reward: [0. 0.] [0.0000], Avg: [  3.077 -32.932] (1.000)
+Step: 699, Reward: [ 70.    -70.632] [70.3162], Avg: [  7.857 -35.625] (1.000)
+Step: 749, Reward: [  0.    -19.795] [9.8974], Avg: [  7.333 -34.569] (1.000)
+Step: 799, Reward: [  0.    -64.593] [32.2967], Avg: [  6.875 -36.446] (1.000)
+Step: 849, Reward: [ 20.    -22.825] [21.4125], Avg: [  7.647 -35.645] (1.000)
+Step: 899, Reward: [ 10.   -11.05] [10.5251], Avg: [  7.778 -34.278] (1.000)
+Step: 949, Reward: [  20.    -120.215] [70.1076], Avg: [  8.421 -38.801] (1.000)
+Step: 999, Reward: [ 0.    -1.786] [0.8931], Avg: [  8.    -36.951] (1.000)

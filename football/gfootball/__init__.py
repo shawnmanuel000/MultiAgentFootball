@@ -14,36 +14,37 @@
 
 """Google Research Football."""
 
-from gfootball.env import scenario_builder
-
 import gym
 from gym.envs.registration import register
-
+from football.gfootball.env import scenario_builder
 
 for env_name in scenario_builder.all_scenarios():
-  register(
-      id='GFootball-{env_name}-SMM-v0'.format(env_name=env_name),
-      entry_point='gfootball.env:create_environment',
-      kwargs={
-          'env_name': env_name,
-          'representation': 'extracted'
-      },
-  )
+    try:
+        register(
+            id='GFootball-{env_name}-SMM-v0'.format(env_name=env_name),
+            entry_point='gfootball.env:create_environment',
+            kwargs={
+                'env_name': env_name,
+                'representation': 'extracted'
+            },
+        )
 
-  register(
-      id='GFootball-{env_name}-Pixels-v0'.format(env_name=env_name),
-      entry_point='gfootball.env:create_environment',
-      kwargs={
-          'env_name': env_name,
-          'representation': 'pixels'
-      },
-  )
+        register(
+            id='GFootball-{env_name}-Pixels-v0'.format(env_name=env_name),
+            entry_point='gfootball.env:create_environment',
+            kwargs={
+                'env_name': env_name,
+                'representation': 'pixels'
+            },
+        )
 
-  register(
-      id='GFootball-{env_name}-simple115-v0'.format(env_name=env_name),
-      entry_point='gfootball.env:create_environment',
-      kwargs={
-          'env_name': env_name,
-          'representation': 'simple115'
-      },
-  )
+        register(
+            id='GFootball-{env_name}-simple115-v0'.format(env_name=env_name),
+            entry_point='gfootball.env:create_environment',
+            kwargs={
+                'env_name': env_name,
+                'representation': 'simple115'
+            },
+        )
+    except:
+        pass

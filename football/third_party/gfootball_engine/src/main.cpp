@@ -130,24 +130,14 @@ void run_game(Properties* input_config, bool render) {
   // sequences
 
   game->context->gameTask = boost::shared_ptr<GameTask>(new GameTask());
-  std::string fontfilename = game->context->config->Get(
-      "font_filename", "media/fonts/alegreya/AlegreyaSansSC-ExtraBold.ttf");
+  std::string fontfilename = game->context->config->Get("font_filename", "media/fonts/alegreya/AlegreyaSansSC-ExtraBold.ttf");
   game->context->font = GetFile(fontfilename);
-  game->context->defaultFont =
-      TTF_OpenFontIndexRW(SDL_RWFromConstMem(game->context->font.data(),
-                                             game->context->font.size()),
-                          0, 32, 0);
+  game->context->defaultFont = TTF_OpenFontIndexRW(SDL_RWFromConstMem(game->context->font.data(), game->context->font.size()), 0, 32, 0);
   if (!game->context->defaultFont)
-    Log(e_FatalError, "football", "main",
-        "Could not load font " + fontfilename);
-  game->context->defaultOutlineFont =
-      TTF_OpenFontIndexRW(SDL_RWFromConstMem(game->context->font.data(),
-                                             game->context->font.size()),
-                          0, 32, 0);
+    Log(e_FatalError, "football", "main", "Could not load font " + fontfilename);
+  game->context->defaultOutlineFont = TTF_OpenFontIndexRW(SDL_RWFromConstMem(game->context->font.data(), game->context->font.size()), 0, 32, 0);
   TTF_SetFontOutline(game->context->defaultOutlineFont, 2);
-  game->context->menuTask = boost::shared_ptr<MenuTask>(
-      new MenuTask(5.0f / 4.0f, 0, game->context->defaultFont,
-                   game->context->defaultOutlineFont, game->context->config));
+  game->context->menuTask = boost::shared_ptr<MenuTask>(new MenuTask(5.0f / 4.0f, 0, game->context->defaultFont, game->context->defaultOutlineFont, game->context->config));
 }
   // fire!
 
@@ -203,10 +193,8 @@ void GameContext::ProcessState(EnvState* state) {
   if (state->Load()) {
     EnvState reader(game, "");
     game->scenario_config.ProcessStateConstant(&reader);
-    if (reader.GetState() != state->GetState().substr(state->getpos(),
-        reader.GetState().length())) {
-      Log(e_FatalError, "football", "set_state",
-          "Current environment scenario != scenario in the state.");
+    if (reader.GetState() != state->GetState().substr(state->getpos(), reader.GetState().length())) {
+      Log(e_FatalError, "football", "set_state", "Current environment scenario != scenario in the state.");
     }
   }
   game->scenario_config.ProcessStateConstant(state);

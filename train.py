@@ -1,84 +1,82 @@
 import gym
 import argparse
 import numpy as np
-import gfootball.env as ggym
-from collections import deque
+import particle_envs.make_env as pgym
+import football.gfootball.env as ggym
 from models.ppo import PPOAgent
+from models.sac import SACAgent
 from models.ddqn import DDQNAgent
 from models.ddpg import DDPGAgent
 from models.rand import RandomAgent
-from utils.envs import EnsembleEnv, EnvManager, EnvWorker, ImgStack, RawStack
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
 from utils.misc import Logger, rollout
-
-parser = argparse.ArgumentParser(description="A3C Trainer")
-parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
-parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
-parser.add_argument("--model", type=str, default="ddpg", choices=["ddqn", "ddpg", "ppo", "rand"], help="Which reinforcement learning algorithm to use")
-parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
-args = parser.parse_args()
+np.set_printoptions(precision=3)
 
 gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
-gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "5_vs_5", "11_vs_11_stochastic"]
-env_name = gfb_envs[5]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-3]
+# env_name = ptc_envs[-2]
 
-def make_env(env_name=env_name, log=False):
-	if env_name in gym_envs: return gym.make(env_name)
-	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
-	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=False)
-	env.unwrapped.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
-	if log: print(f"State space: {env.observation_space.shape} \nAction space: {env.action_space.n}")
-	return env
+def make_env(env_name=env_name, log=False, render=False, reward_shape=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward,eps: [0.1*(ballr(o[0,88], o[0,89]) - o[0,96]) + r for o,r in zip(obs,reward)]
+	return FootballTeamEnv(ggym, env_name, reward_fn if reward_shape else None)
 
-class AsyncAgent(RandomAgent):
-	def __init__(self, state_size, action_size, num_envs, agent, load="", gpu=True, train=True):
-		super().__init__(state_size, action_size)
-		statemodel = RawStack if len(state_size) == 1 else ImgStack
-		self.stack = statemodel(state_size, num_envs, load=load, gpu=gpu)
-		self.agent = agent(self.stack.state_size, action_size, load="" if train else load, gpu=gpu)
-
-	def get_env_action(self, env, state, eps=None, sample=True):
-		state = self.stack.get_state(state)
-		env_action, action = self.agent.get_env_action(env, state, eps, sample)
-		return env_action, action, state
-
-	def train(self, state, action, next_state, reward, done):
-		next_state = self.stack.get_state(next_state)
-		self.agent.train(state, action, next_state, reward, done)
-
-	def reset(self, num_envs=None):
-		num_envs = self.stack.num_envs if num_envs is None else num_envs
-		self.stack.reset(num_envs, restore=False)
-		return self
-
-	def save_model(self, dirname="pytorch", name="best"):
-		if hasattr(self.agent, "network"): self.agent.network.save_model(dirname, name)
-
-def run(model, steps=10000, ports=16, eval_at=1000, checkpoint=False):
-	num_envs = len(ports) if type(ports) == list else min(ports, 64)
-	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
-	agent = AsyncAgent(envs.state_size, envs.action_size, num_envs, model)
-	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.stack.state_size, action_size=envs.action_size, action_space=envs.env.action_space)
-	states = envs.reset()
+def train(model, steps=10000, ports=16, env_name=env_name, trial_at=10000, save_at=10, checkpoint=True, save_best=False, log=True, render=False, reward_shape=False, icm=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name, reward_shape=reward_shape), ports)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=icm) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), reward_shape=reward_shape, icm=icm)
+	states = envs.reset(train=True)
 	total_rewards = []
-	for s in range(steps):
-		agent.reset(num_envs)
+	for s in range(steps+1):
 		env_actions, actions, states = agent.get_env_action(envs.env, states)
-		next_states, rewards, dones, _ = envs.step(env_actions)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
 		agent.train(states, actions, next_states, rewards, dones)
 		states = next_states
-		if dones[0]:
-			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
-			test_reward = np.mean(rollouts) - np.std(rollouts)
-			total_rewards.append(test_reward)
-			if checkpoint: agent.save_model(env_name, "checkpoint")
-			if env_name in gfb_envs and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
-			logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts):.4f} [{np.std(rollouts):.2f}], Avg: {np.mean(total_rewards):.4f} ({agent.agent.eps:.3f})")
+		if s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			save_dir = env_name + "/" +  "_".join(["rs"]*int(reward_shape) + ["icm"]*int(icm))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(save_dir, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})", agent.get_stats())
+
+def trial(model, env_name, render, reward_shape=False, icm=False):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 1)
+	load_dir = env_name + "/" +  "_".join(["rs"]*int(reward_shape) + ["icm"]*int(icm))
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=load_dir, agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {rollout(envs, agent, eps=0.0, render=True)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="coma", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=200000, help="Number of steps to train the agent")
+	parser.add_argument("--reward_shape", action="store_true", help="Whether to shape rewards for football")
+	parser.add_argument("--icm", action="store_true", help="Whether to use intrinsic motivation")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
 
 if __name__ == "__main__":
-	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent if args.model == "ddqn" else RandomAgent
-	if args.selfport is not None:
-		EnvWorker(args.selfport, make_env).start()
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.selfport is not None or MPI_RANK>0:
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	elif args.trial:
+		trial(model=model, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)
 	else:
-		if len(args.workerports) == 1: args.workerports = args.workerports[0]
-		run(model, args.steps, args.workerports)
-	print(f"Training finished")
+		train(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)

@@ -1,0 +1,1358 @@
+Model: <class 'multiagent.coma.COMAAgent'>, Dir: simple_spread
+num_envs: 4,
+state_size: [(1, 18), (1, 18), (1, 18)],
+action_size: [[1, 5], [1, 5], [1, 5]],
+action_space: [MultiDiscrete([5]), MultiDiscrete([5]), MultiDiscrete([5])],
+envs: <class 'utils.envs.EnsembleEnv'>,
+reward_shape: False,
+icm: False,
+
+import copy
+import torch
+import numpy as np
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, one_hot_from_indices
+
+LEARNING_RATE = 0.003
+LAMBDA = 0.95
+DISCOUNT_RATE = 0.99
+GRAD_NORM = 10
+TARGET_UPDATE = 200
+
+HIDDEN_SIZE = 64
+EPS_MAX = 0.5
+EPS_MIN = 0.01
+EPS_DECAY = 0.995
+NUM_ENVS = 4
+EPISODE_LIMIT = 50
+REPLAY_BATCH_SIZE = 64
+
+class COMAAgent(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, lambda *args, **kwargs: None, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+		del self.network
+		n_agents = len(action_size)
+		n_actions = action_size[0][-1]
+		n_obs = state_size[0][-1]
+		state_len = int(np.sum([np.prod(space) for space in state_size]))
+		preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=n_actions)])}
+		groups = {"agents": n_agents}
+		scheme = {
+			"state": {"vshape": state_len},
+			"obs": {"vshape": n_obs, "group": "agents"},
+			"actions": {"vshape": (1,), "group": "agents", "dtype": torch.long},
+			"reward": {"vshape": (1,)},
+			"done": {"vshape": (1,), "dtype": torch.uint8},
+		}
+		
+		self.device = torch.device('cuda' if gpu and torch.cuda.is_available() else 'cpu')
+		self.replay_buffer = ReplayBuffer(scheme, groups, NUM_ENVS, EPISODE_LIMIT+1, preprocess=preprocess, device=self.device)
+		self.mac = BasicMAC(self.replay_buffer.scheme, groups, n_agents, n_actions, device=self.device)
+		self.learner = COMALearner(self.mac, self.replay_buffer.scheme, n_agents, n_actions, device=self.device)
+		self.new_episode_batch = lambda batch_size: EpisodeBatch(scheme, groups, batch_size, EPISODE_LIMIT+1, preprocess=preprocess, device=self.device)
+		self.episode_batch = self.new_episode_batch(NUM_ENVS)
+		self.mac.init_hidden(batch_size=NUM_ENVS)
+		self.num_envs = NUM_ENVS
+		self.time = 0
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		self.num_envs = state[0].shape[0] if len(state[0].shape) > len(self.state_size[0]) else 1
+		if np.prod(self.mac.hidden_states.shape[:-1]) != self.num_envs*len(self.action_size): self.mac.init_hidden(batch_size=self.num_envs)
+		if self.episode_batch.batch_size != self.num_envs: self.episode_batch = self.new_episode_batch(self.num_envs)
+		self.step = 0 if not hasattr(self, "step") else (self.step + 1)%self.replay_buffer.max_seq_length
+		state_joint = np.concatenate(state, -1)
+		obs = np.concatenate(state, -2)
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.learner.n_agents), 0), repeats=self.num_envs, axis=0)
+		if not hasattr(self, "action"): self.action = np.zeros([*obs.shape[:-1], self.action_size[0][-1]])
+		inputs = torch.from_numpy(np.concatenate([obs, self.action, agent_ids], -1))
+		self.episode_batch.update({"state": [state_joint], "obs": [obs]}, ts=self.step)
+		actions = self.mac.select_actions(self.episode_batch, inputs, t_ep=self.step, t_env=self.time, test_mode=False)
+		self.action = one_hot_from_indices(actions, self.action_size[0][-1]).cpu().numpy()
+		actions = actions.view([*state[0].shape[:-len(self.state_size[0])], actions.shape[-1]])
+		return np.split(self.action, actions.size(-1), axis=-2)
+
+	def train(self, state, action, next_state, reward, done):
+		action, reward, done = [list(zip(*x)) for x in [action, reward, done]]
+		actions_one_hot = [np.argmax(a, -1) for a in action]
+		rewards = [np.mean(reward, -1)]
+		dones = [np.any(done, -1)]
+		state_joint = np.concatenate(state, -1)
+		obs = np.concatenate(state, -2)
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.learner.n_agents), 0), repeats=self.num_envs, axis=0)
+		actor_inputs = torch.from_numpy(np.concatenate([obs, self.action, agent_ids], -1))
+		post_transition_data = {"actions": actions_one_hot, "reward": rewards, "done": dones}
+		self.episode_batch.update(post_transition_data, ts=self.step)
+		if np.any(done[0]):
+			self.episode_batch.update({"state": [np.concatenate(next_state, -1)], "obs": [np.concatenate(next_state, -2)]}, ts=self.step)
+			actions = self.mac.select_actions(self.episode_batch, actor_inputs, t_ep=self.step, t_env=self.time, test_mode=False)
+			self.episode_batch.update({"actions": actions}, ts=self.step)
+			self.replay_buffer.insert_episode_batch(self.episode_batch)
+			if self.replay_buffer.can_sample(REPLAY_BATCH_SIZE):
+				episode_sample = self.replay_buffer.sample(REPLAY_BATCH_SIZE)
+				max_ep_t = episode_sample.max_t_filled()
+				episode_sample = episode_sample[:, :max_ep_t]
+				if episode_sample.device != self.device: episode_sample.to(self.device)
+				self.learner.train(episode_sample)
+			self.episode_batch = self.new_episode_batch(state[0].shape[0])
+			self.mac.init_hidden(self.num_envs)
+			self.time += self.step
+			self.step = 0
+
+class OneHot():
+	def __init__(self, out_dim):
+		self.out_dim = out_dim
+
+	def transform(self, tensor):
+		y_onehot = tensor.new(*tensor.shape[:-1], self.out_dim).zero_()
+		y_onehot.scatter_(-1, tensor.long(), 1)
+		return y_onehot.float()
+
+	def infer_output_info(self, vshape_in, dtype_in):
+		return (self.out_dim,), torch.float32
+
+class COMALearner():
+	def __init__(self, mac, scheme, n_agents, n_actions, device):
+		self.device = device
+		self.n_agents = n_agents
+		self.n_actions = n_actions
+		self.last_target_update_step = 0
+		self.mac = mac
+		self.critic_training_steps = 0
+		self.critic = COMACritic(scheme, self.n_agents, self.n_actions).to(self.device)
+		self.critic_params = list(self.critic.parameters())
+		self.agent_params = list(mac.parameters())
+		self.params = self.agent_params + self.critic_params
+		self.target_critic = copy.deepcopy(self.critic)
+		self.agent_optimiser = torch.optim.Adam(params=self.agent_params, lr=LEARNING_RATE)
+		self.critic_optimiser = torch.optim.Adam(params=self.critic_params, lr=LEARNING_RATE)
+
+	def train(self, batch):
+		# Get the relevant quantities
+		bs = batch.batch_size
+		max_t = batch.max_seq_length
+		rewards = batch["reward"][:, :-1]
+		actions = batch["actions"][:, :]
+		done = batch["done"][:, :-1].float()
+		mask = batch["filled"][:, :-1].float()
+		mask[:, 1:] = mask[:, 1:] * (1 - done[:, :-1])
+		critic_mask = mask.clone()
+		mask = mask.repeat(1, 1, self.n_agents).view(-1)
+		q_vals = self._train_critic(batch, rewards, done, actions, critic_mask, bs, max_t)
+		actions = actions[:,:-1]
+		mac_out = []
+		self.mac.init_hidden(batch.batch_size)
+		for t in range(batch.max_seq_length - 1):
+			agent_outs = self.mac.forward(batch, t=t)
+			mac_out.append(agent_outs)
+		mac_out = torch.stack(mac_out, dim=1)  # Concat over time
+		# Mask out unavailable actions, renormalise (as in action selection)
+		q_vals = q_vals.reshape(-1, self.n_actions)
+		pi = mac_out.view(-1, self.n_actions)
+		baseline = (pi * q_vals).sum(-1).detach()
+		q_taken = torch.gather(q_vals, dim=1, index=actions.reshape(-1, 1)).squeeze(1)
+		pi_taken = torch.gather(pi, dim=1, index=actions.reshape(-1, 1)).squeeze(1)
+		pi_taken[mask == 0] = 1.0
+		log_pi_taken = torch.log(pi_taken)
+		advantages = (q_taken - baseline).detach()
+		coma_loss = - ((advantages * log_pi_taken) * mask).sum() / mask.sum()
+		self.agent_optimiser.zero_grad()
+		coma_loss.backward()
+		torch.nn.utils.clip_grad_norm_(self.agent_params, GRAD_NORM)
+		self.agent_optimiser.step()
+		if (self.critic_training_steps - self.last_target_update_step) / TARGET_UPDATE >= 1.0:
+			self._update_targets()
+			self.last_target_update_step = self.critic_training_steps
+
+	def _train_critic(self, batch, rewards, done, actions, mask, bs, max_t):
+		target_q_vals = self.target_critic(batch)[:, :]
+		targets_taken = torch.gather(target_q_vals, dim=3, index=actions).squeeze(3)
+		targets = build_td_lambda_targets(rewards, done, mask, targets_taken, self.n_agents)
+		q_vals = torch.zeros_like(target_q_vals)[:, :-1]
+		for t in reversed(range(rewards.size(1))):
+			mask_t = mask[:, t].expand(-1, self.n_agents)
+			if mask_t.sum() == 0:
+				continue
+			q_t = self.critic(batch, t)
+			q_vals[:, t] = q_t.view(bs, self.n_agents, self.n_actions)
+			q_taken = torch.gather(q_t, dim=3, index=actions[:, t:t+1]).squeeze(3).squeeze(1)
+			targets_t = targets[:, t]
+			td_error = (q_taken - targets_t.detach())
+			# 0-out the targets that came from padded data
+			masked_td_error = td_error * mask_t
+			loss = (masked_td_error ** 2).sum() / mask_t.sum()
+			self.critic_optimiser.zero_grad()
+			loss.backward()
+			torch.nn.utils.clip_grad_norm_(self.critic_params, GRAD_NORM)
+			self.critic_optimiser.step()
+			self.critic_training_steps += 1
+		return q_vals
+
+	def _update_targets(self):
+		self.target_critic.load_state_dict(self.critic.state_dict())
+
+	def cuda(self):
+		self.mac.cuda()
+		self.critic.cuda()
+		self.target_critic.cuda()
+
+def build_td_lambda_targets(rewards, done, mask, target_qs, n_agents, gamma=DISCOUNT_RATE, td_lambda=LAMBDA):
+	# Assumes  <target_qs > in B*T*A and <reward >, <done >, <mask > in (at least) B*T-1*1
+	# Initialise  last  lambda -return  for  not  done  episodes
+	ret = target_qs.new_zeros(*target_qs.shape)
+	ret[:, -1] = target_qs[:, -1] * (1 - torch.sum(done, dim=1))
+	# Backwards  recursive  update  of the "forward  view"
+	for t in range(ret.shape[1] - 2, -1,  -1):
+		ret[:, t] = td_lambda * gamma * ret[:, t + 1] + mask[:, t]*(rewards[:, t] + (1 - td_lambda) * gamma * target_qs[:, t + 1] * (1 - done[:, t]))
+	# Returns lambda-return from t=0 to t=T-1, i.e. in B*T-1*A
+	return ret[:, 0:-1]
+
+class COMACritic(torch.nn.Module):
+	def __init__(self, scheme, n_agents, n_actions):
+		super(COMACritic, self).__init__()
+		self.n_actions = n_actions
+		self.n_agents = n_agents
+		input_shape = self._get_input_shape(scheme)
+		self.output_type = "q"
+		self.fc1 = torch.nn.Linear(input_shape, HIDDEN_SIZE)
+		self.fc2 = torch.nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+		self.fc3 = torch.nn.Linear(HIDDEN_SIZE, self.n_actions)
+
+	def forward(self, batch, t=None):
+		inputs = self._build_inputs(batch, t=t)
+		x = torch.relu(self.fc1(inputs))
+		x = torch.relu(self.fc2(x))
+		q = self.fc3(x)
+		return q
+
+	def _build_inputs(self, batch, t=None):
+		bs = batch.batch_size
+		max_t = batch.max_seq_length if t is None else 1
+		ts = slice(None) if t is None else slice(t, t+1)
+		inputs = []
+		inputs.append(batch["state"][:, ts].unsqueeze(2).repeat(1, 1, self.n_agents, 1))
+		inputs.append(batch["obs"][:, ts])
+		actions = batch["actions_onehot"][:, ts].view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
+		agent_mask = (1 - torch.eye(self.n_agents, device=batch.device))
+		agent_mask = agent_mask.view(-1, 1).repeat(1, self.n_actions).view(self.n_agents, -1)
+		inputs.append(actions * agent_mask.unsqueeze(0).unsqueeze(0))
+		# last actions
+		if t == 0:
+			inputs.append(torch.zeros_like(batch["actions_onehot"][:, 0:1]).view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1))
+		elif isinstance(t, int):
+			inputs.append(batch["actions_onehot"][:, slice(t-1, t)].view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1))
+		else:
+			last_actions = torch.cat([torch.zeros_like(batch["actions_onehot"][:, 0:1]), batch["actions_onehot"][:, :-1]], dim=1)
+			last_actions = last_actions.view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
+			inputs.append(last_actions)
+
+		inputs.append(torch.eye(self.n_agents, device=batch.device).unsqueeze(0).unsqueeze(0).expand(bs, max_t, -1, -1))
+		inputs = torch.cat([x.reshape(bs, max_t, self.n_agents, -1) for x in inputs], dim=-1)
+		return inputs
+
+	def _get_input_shape(self, scheme):
+		input_shape = scheme["state"]["vshape"]
+		input_shape += scheme["obs"]["vshape"]
+		input_shape += scheme["actions_onehot"]["vshape"][0] * self.n_agents * 2
+		input_shape += self.n_agents
+		return input_shape
+
+class BasicMAC:
+	def __init__(self, scheme, groups, n_agents, n_actions, device):
+		self.device = device
+		self.n_agents = n_agents
+		self.n_actions = n_actions
+		self.agent = RNNAgent(self._get_input_shape(scheme), self.n_actions).to(self.device)
+		self.action_selector = MultinomialActionSelector()
+		self.hidden_states = None
+
+	def select_actions(self, ep_batch, inputs, t_ep, t_env, bs=slice(None), test_mode=False):
+		agent_outputs = self.forward(ep_batch, inputs, t_ep, test_mode=test_mode)
+		chosen_actions = self.action_selector.select_action(agent_outputs[bs], t_env, test_mode=test_mode)
+		return chosen_actions
+
+	def forward(self, ep_batch, inputs, t, test_mode=False):
+		agent_inputs = self._build_inputs(ep_batch, t)
+		agent_outs = self.agent(agent_inputs, self.hidden_states)
+		agent_outs = torch.nn.functional.softmax(agent_outs, dim=-1)
+		if not test_mode:
+			epsilon_action_num = agent_outs.size(-1)
+			agent_outs = ((1 - self.action_selector.epsilon) * agent_outs + torch.ones_like(agent_outs).to(self.device) * self.action_selector.epsilon/epsilon_action_num)
+		return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
+
+	def init_hidden(self, batch_size):
+		self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
+
+	def parameters(self):
+		return self.agent.parameters()
+
+	def _build_inputs(self, batch, t):
+		bs = batch.batch_size
+		inputs = []
+		inputs.append(batch["obs"][:, t])  # b1av
+		inputs.append(torch.zeros_like(batch["actions_onehot"][:, t]) if t==0 else batch["actions_onehot"][:, t-1])
+		inputs.append(torch.eye(self.n_agents, device=batch.device).unsqueeze(0).expand(bs, -1, -1))
+		inputs = torch.cat([x.reshape(bs, self.n_agents, -1) for x in inputs], dim=-1)
+		return inputs
+
+	def _get_input_shape(self, scheme):
+		input_shape = scheme["obs"]["vshape"]
+		input_shape += scheme["actions_onehot"]["vshape"][0]
+		input_shape += self.n_agents
+		return input_shape
+
+class RNNAgent(torch.nn.Module):
+	def __init__(self, input_shape, output_shape):
+		super(RNNAgent, self).__init__()
+		self.fc1 = torch.nn.Linear(input_shape, HIDDEN_SIZE)
+		# self.rnn = torch.nn.GRUCell(HIDDEN_SIZE, HIDDEN_SIZE)
+		self.fc2 = torch.nn.Linear(HIDDEN_SIZE, output_shape)
+
+	def init_hidden(self):
+		return self.fc1.weight.new(1, HIDDEN_SIZE).zero_()
+
+	def forward(self, inputs, hidden_state):
+		x = torch.relu(self.fc1(inputs))
+		# h_in = hidden_state.reshape(-1, HIDDEN_SIZE)
+		# h = self.rnn(x, h_in)
+		q = self.fc2(x)
+		return q
+
+class MultinomialActionSelector():
+	def __init__(self, eps_start=EPS_MAX, eps_finish=EPS_MIN, eps_decay=EPS_DECAY):
+		self.schedule = DecayThenFlatSchedule(eps_start, eps_finish, EPISODE_LIMIT/(1-eps_decay), decay="linear")
+		self.epsilon = self.schedule.eval(0)
+
+	def select_action(self, agent_inputs, t_env, test_mode=False):
+		self.epsilon = self.schedule.eval(t_env)
+		masked_policies = agent_inputs.clone()
+		picked_actions = masked_policies.max(dim=2)[1] if test_mode else torch.distributions.Categorical(masked_policies).sample().long()
+		return picked_actions
+
+class DecayThenFlatSchedule():
+	def __init__(self, start, finish, time_length, decay="exp"):
+		self.start = start
+		self.finish = finish
+		self.time_length = time_length
+		self.delta = (self.start - self.finish) / self.time_length
+		self.decay = decay
+		if self.decay in ["exp"]:
+			self.exp_scaling = (-1) * self.time_length / np.log(self.finish) if self.finish > 0 else 1
+
+	def eval(self, T):
+		if self.decay in ["linear"]:
+			return max(self.finish, self.start - self.delta * T)
+		elif self.decay in ["exp"]:
+			return min(self.start, max(self.finish, np.exp(- T / self.exp_scaling)))
+
+from types import SimpleNamespace as SN
+
+class EpisodeBatch():
+	def __init__(self, scheme, groups, batch_size, max_seq_length, data=None, preprocess=None, device="cpu"):
+		self.scheme = scheme.copy()
+		self.groups = groups
+		self.batch_size = batch_size
+		self.max_seq_length = max_seq_length
+		self.preprocess = {} if preprocess is None else preprocess
+		self.device = device
+
+		if data is not None:
+			self.data = data
+		else:
+			self.data = SN()
+			self.data.transition_data = {}
+			self.data.episode_data = {}
+			self._setup_data(self.scheme, self.groups, batch_size, max_seq_length, self.preprocess)
+
+	def _setup_data(self, scheme, groups, batch_size, max_seq_length, preprocess):
+		if preprocess is not None:
+			for k in preprocess:
+				assert k in scheme
+				new_k = preprocess[k][0]
+				transforms = preprocess[k][1]
+				vshape = self.scheme[k]["vshape"]
+				dtype = self.scheme[k]["dtype"]
+				for transform in transforms:
+					vshape, dtype = transform.infer_output_info(vshape, dtype)
+				self.scheme[new_k] = {"vshape": vshape, "dtype": dtype}
+				if "group" in self.scheme[k]:
+					self.scheme[new_k]["group"] = self.scheme[k]["group"]
+				if "episode_const" in self.scheme[k]:
+					self.scheme[new_k]["episode_const"] = self.scheme[k]["episode_const"]
+
+		assert "filled" not in scheme, '"filled" is a reserved key for masking.'
+		scheme.update({"filled": {"vshape": (1,), "dtype": torch.long},})
+
+		for field_key, field_info in scheme.items():
+			assert "vshape" in field_info, "Scheme must define vshape for {}".format(field_key)
+			vshape = field_info["vshape"]
+			episode_const = field_info.get("episode_const", False)
+			group = field_info.get("group", None)
+			dtype = field_info.get("dtype", torch.float32)
+
+			if isinstance(vshape, int):
+				vshape = (vshape,)
+			if group:
+				assert group in groups, "Group {} must have its number of members defined in _groups_".format(group)
+				shape = (groups[group], *vshape)
+			else:
+				shape = vshape
+			if episode_const:
+				self.data.episode_data[field_key] = torch.zeros((batch_size, *shape), dtype=dtype).to(self.device)
+			else:
+				self.data.transition_data[field_key] = torch.zeros((batch_size, max_seq_length, *shape), dtype=dtype).to(self.device)
+
+	def extend(self, scheme, groups=None):
+		self._setup_data(scheme, self.groups if groups is None else groups, self.batch_size, self.max_seq_length)
+
+	def to(self, device):
+		for k, v in self.data.transition_data.items():
+			self.data.transition_data[k] = v.to(device)
+		for k, v in self.data.episode_data.items():
+			self.data.episode_data[k] = v.to(device)
+		self.device = device
+
+	def update(self, data, bs=slice(None), ts=slice(None), mark_filled=True):
+		slices = self._parse_slices((bs, ts))
+		for k, v in data.items():
+			if k in self.data.transition_data:
+				target = self.data.transition_data
+				if mark_filled:
+					target["filled"][slices] = 1
+					mark_filled = False
+				_slices = slices
+			elif k in self.data.episode_data:
+				target = self.data.episode_data
+				_slices = slices[0]
+			else:
+				raise KeyError("{} not found in transition or episode data".format(k))
+
+			dtype = self.scheme[k].get("dtype", torch.float32)
+			v = v if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=dtype, device=self.device)
+			self._check_safe_view(v, target[k][_slices])
+			target[k][_slices] = v.view_as(target[k][_slices])
+
+			if k in self.preprocess:
+				new_k = self.preprocess[k][0]
+				v = target[k][_slices]
+				for transform in self.preprocess[k][1]:
+					v = transform.transform(v)
+				target[new_k][_slices] = v.view_as(target[new_k][_slices])
+
+	def _check_safe_view(self, v, dest):
+		idx = len(v.shape) - 1
+		for s in dest.shape[::-1]:
+			if v.shape[idx] != s:
+				if s != 1:
+					raise ValueError("Unsafe reshape of {} to {}".format(v.shape, dest.shape))
+			else:
+				idx -= 1
+
+	def __getitem__(self, item):
+		if isinstance(item, str):
+			if item in self.data.episode_data:
+				return self.data.episode_data[item]
+			elif item in self.data.transition_data:
+				return self.data.transition_data[item]
+			else:
+				raise ValueError
+		elif isinstance(item, tuple) and all([isinstance(it, str) for it in item]):
+			new_data = self._new_data_sn()
+			for key in item:
+				if key in self.data.transition_data:
+					new_data.transition_data[key] = self.data.transition_data[key]
+				elif key in self.data.episode_data:
+					new_data.episode_data[key] = self.data.episode_data[key]
+				else:
+					raise KeyError("Unrecognised key {}".format(key))
+
+			# Update the scheme to only have the requested keys
+			new_scheme = {key: self.scheme[key] for key in item}
+			new_groups = {self.scheme[key]["group"]: self.groups[self.scheme[key]["group"]]
+						for key in item if "group" in self.scheme[key]}
+			ret = EpisodeBatch(new_scheme, new_groups, self.batch_size, self.max_seq_length, data=new_data, device=self.device)
+			return ret
+		else:
+			item = self._parse_slices(item)
+			new_data = self._new_data_sn()
+			for k, v in self.data.transition_data.items():
+				new_data.transition_data[k] = v[item]
+			for k, v in self.data.episode_data.items():
+				new_data.episode_data[k] = v[item[0]]
+
+			ret_bs = self._get_num_items(item[0], self.batch_size)
+			ret_max_t = self._get_num_items(item[1], self.max_seq_length)
+
+			ret = EpisodeBatch(self.scheme, self.groups, ret_bs, ret_max_t, data=new_data, device=self.device)
+			return ret
+
+	def _get_num_items(self, indexing_item, max_size):
+		if isinstance(indexing_item, list) or isinstance(indexing_item, np.ndarray):
+			return len(indexing_item)
+		elif isinstance(indexing_item, slice):
+			_range = indexing_item.indices(max_size)
+			return 1 + (_range[1] - _range[0] - 1)//_range[2]
+
+	def _new_data_sn(self):
+		new_data = SN()
+		new_data.transition_data = {}
+		new_data.episode_data = {}
+		return new_data
+
+	def _parse_slices(self, items):
+		parsed = []
+		# Only batch slice given, add full time slice
+		if (isinstance(items, slice)  # slice a:b
+			or isinstance(items, int)  # int i
+			or (isinstance(items, (list, np.ndarray, torch.LongTensor, torch.cuda.LongTensor)))  # [a,b,c]
+			):
+			items = (items, slice(None))
+
+		# Need the time indexing to be contiguous
+		if isinstance(items[1], list):
+			raise IndexError("Indexing across Time must be contiguous")
+
+		for item in items:
+			#TODO: stronger checks to ensure only supported options get through
+			if isinstance(item, int):
+				# Convert single indices to slices
+				parsed.append(slice(item, item+1))
+			else:
+				# Leave slices and lists as is
+				parsed.append(item)
+		return parsed
+
+	def max_t_filled(self):
+		return torch.sum(self.data.transition_data["filled"], 1).max(0)[0]
+
+class ReplayBuffer(EpisodeBatch):
+	def __init__(self, scheme, groups, buffer_size, max_seq_length, preprocess=None, device="cpu"):
+		super(ReplayBuffer, self).__init__(scheme, groups, buffer_size, max_seq_length, preprocess=preprocess, device=device)
+		self.buffer_size = buffer_size  # same as self.batch_size but more explicit
+		self.buffer_index = 0
+		self.episodes_in_buffer = 0
+
+	def insert_episode_batch(self, ep_batch):
+		if self.buffer_index + ep_batch.batch_size <= self.buffer_size:
+			self.update(ep_batch.data.transition_data, slice(self.buffer_index, self.buffer_index + ep_batch.batch_size), slice(0, ep_batch.max_seq_length), mark_filled=False)
+			self.update(ep_batch.data.episode_data, slice(self.buffer_index, self.buffer_index + ep_batch.batch_size))
+			self.buffer_index = (self.buffer_index + ep_batch.batch_size)
+			self.episodes_in_buffer = max(self.episodes_in_buffer, self.buffer_index)
+			self.buffer_index = self.buffer_index % self.buffer_size
+			assert self.buffer_index < self.buffer_size
+		else:
+			buffer_left = self.buffer_size - self.buffer_index
+			self.insert_episode_batch(ep_batch[0:buffer_left, :])
+			self.insert_episode_batch(ep_batch[buffer_left:, :])
+
+	def can_sample(self, batch_size):
+		return self.episodes_in_buffer >= batch_size
+
+	def sample(self, batch_size):
+		assert self.can_sample(batch_size)
+		if self.episodes_in_buffer == batch_size:
+			return self[:batch_size]
+		else:
+			ep_ids = np.random.choice(self.episodes_in_buffer, batch_size, replace=False)
+			return self[ep_ids]
+
+
+# import torch
+# import random
+# import numpy as np
+# from utils.wrappers import ParallelAgent
+# from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, one_hot, gsoftmax
+
+# EPS_DECAY = 0.995             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+# INPUT_LAYER = 64
+# ACTOR_HIDDEN = 64
+# CRITIC_HIDDEN = 64
+
+# class COMAActor(torch.nn.Module):
+# 	def __init__(self, state_size, action_size):
+# 		super().__init__()
+# 		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+# 		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+# 		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+# 		self.recurrent = torch.nn.GRUCell(ACTOR_HIDDEN, ACTOR_HIDDEN)
+# 		self.action_probs = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+# 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+# 		self.init_hidden()
+
+# 	def forward(self, state, sample=True):
+# 		state = self.layer1(state).relu()
+# 		state = self.layer2(state).relu()
+# 		state = self.layer3(state).relu()
+# 		out_dims = state.size()[:-1]
+# 		state = state.view(int(np.prod(out_dims)), -1)
+# 		if self.hidden.size(0) != state.size(0): self.init_hidden(state.size(0))
+# 		self.hidden = self.recurrent(state, self.hidden)
+# 		action_probs = gsoftmax(self.action_probs(self.hidden), hard=False)
+# 		action_probs = action_probs.view(*out_dims, -1)
+# 		return action_probs
+
+# 	def init_hidden(self, batch_size=1):
+# 		self.hidden = torch.zeros([batch_size, ACTOR_HIDDEN])
+
+# class COMACritic(torch.nn.Module):
+# 	def __init__(self, state_size, action_size):
+# 		super().__init__()
+# 		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+# 		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+# 		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+# 		self.q_values = torch.nn.Linear(CRITIC_HIDDEN, action_size[-1])
+# 		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+# 	def forward(self, state):
+# 		state = self.layer1(state).relu()
+# 		state = self.layer2(state).relu()
+# 		state = self.layer3(state).relu()
+# 		q_values = self.q_values(state)
+# 		return q_values
+
+# class COMANetwork(PTNetwork):
+# 	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+# 		super().__init__(gpu=gpu)
+# 		self.state_size = [state_size] if type(state_size[0]) in [int, np.int32] else state_size
+# 		self.action_size = [action_size] if type(action_size[0]) in [int, np.int32] else action_size
+# 		self.n_agents = lambda size: 1 if len(size)==1 else size[0]
+# 		make_actor = lambda s_size,a_size: COMAActor([s_size[-1] + a_size[-1] + self.n_agents(s_size)], a_size)
+# 		make_critic = lambda s_size,a_size: COMACritic([np.sum([np.prod(s) for s in self.state_size]) + 2*np.sum([np.prod(a) for a in self.action_size]) + s_size[-1] + self.n_agents(s_size)], a_size)
+# 		self.models = [PTACNetwork(s_size, a_size, make_actor, make_critic, lr=lr, gpu=gpu, load=load) for s_size,a_size in zip(self.state_size, self.action_size)]
+# 		if load: self.load_model(load)
+		
+# 	def get_action_probs(self, state, sample=True, grad=True, numpy=False):
+# 		with torch.enable_grad() if grad else torch.no_grad():
+# 			action = [model.actor_local(s.to(self.device), sample) for s,model in zip(state, self.models)]
+# 			return [a.cpu().numpy().astype(np.float32) for a in action] if numpy else action
+
+# 	def get_value(self, state, grad=True, numpy=False):
+# 		with torch.enable_grad() if grad else torch.no_grad():
+# 			q_values = [model.critic_local(s.to(self.device)) for s,model in zip(state, self.models)]
+# 			return [q.cpu().numpy() for q in q_values] if numpy else q_values
+
+# 	def optimize(self, actions, actor_inputs, critic_inputs, q_values, q_targets):
+# 		for model,action,actor_input,critic_input,q_value,q_target in zip(self.models, actions, actor_inputs, critic_inputs, q_values, q_targets):
+# 			for t in reversed(range(q_target.size(0))):
+# 				q_value[t] = model.critic_local(critic_input[t])
+# 				q_select = torch.gather(q_value[t], dim=-1, index=action[t].argmax(-1, keepdims=True)).squeeze(-1)
+# 				critic_loss = (q_select - q_target[t].detach()).pow(2)
+# 				model.step(model.critic_optimizer, critic_loss.mean(), retain=t>0)
+
+# 			hidden = model.actor_local.hidden
+# 			action_probs = torch.stack([model.actor_local(actor_input[t]) for t in range(q_target.size(0))], dim=0)
+# 			baseline = (action_probs * q_value[:-1]).sum(-1, keepdims=True).detach()
+# 			q_selected = torch.gather(q_value[:-1], dim=-1, index=action[:-1].argmax(-1, keepdims=True))
+# 			log_probs = torch.gather(action_probs, dim=-1, index=action[:-1].argmax(-1, keepdims=True)).log()
+# 			advantages = (q_selected - baseline).detach()
+# 			actor_loss = (advantages * log_probs).sum() + 0.001*action_probs.pow(2).mean()
+# 			model.step(model.actor_optimizer, actor_loss.mean())
+# 			model.actor_local.hidden = hidden
+
+# 	def save_model(self, dirname="pytorch", name="best"):
+# 		[model.save_model("coma", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+		
+# 	def load_model(self, dirname="pytorch", name="best"):
+# 		[model.load_model("coma", dirname, f"{name}_{i}") for i,model in enumerate(self.models)]
+
+# class COMAAgent(PTACAgent):
+# 	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+# 		super().__init__(state_size, action_size, COMANetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+
+# 	def get_action(self, state, eps=None, sample=True, numpy=True):
+# 		eps = self.eps if eps is None else eps
+# 		action_random = super().get_action(state)
+# 		if not hasattr(self, "action"): self.action = [np.zeros_like(a) for a in action_random]
+# 		actor_inputs = []
+# 		state_list = self.to_tensor(state)
+# 		state_list = [state_list] if type(state_list) != list else state_list
+# 		for i,(state,last_a,s_size,a_size) in enumerate(zip(state_list, self.action, self.state_size, self.action_size)):
+# 			n_agents = self.network.n_agents(s_size)
+# 			last_action = last_a if len(state.shape)-len(s_size) == len(last_a.shape)-len(a_size) else np.zeros_like(action_random[i])
+# 			agent_ids = np.eye(n_agents) if len(state.shape)==len(s_size) else np.repeat(np.expand_dims(np.eye(n_agents), 0), repeats=state.shape[0], axis=0)
+# 			actor_input = torch.tensor(np.concatenate([state, last_action, agent_ids], axis=-1), device=self.network.device).float()
+# 			actor_inputs.append(actor_input)
+# 		action_greedy = self.network.get_action_probs(actor_inputs, sample=sample, grad=False, numpy=numpy)
+# 		action = action_random if numpy and random.random() < eps else action_greedy
+# 		if numpy: self.action = action
+# 		return action
+
+# 	def train(self, state, action, next_state, reward, done):
+# 		self.buffer.append((state, action, reward, done))
+# 		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+# 			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+# 			self.buffer.clear()
+
+# 			n_agents = [self.network.n_agents(a_size) for a_size in self.action_size]
+# 			states = [torch.cat([s, ns.unsqueeze(0)], dim=0) for s,ns in zip(states, self.to_tensor(next_state))]
+# 			actions = [torch.cat([a, na.unsqueeze(0)], dim=0) for a,na in zip(actions, self.get_action(next_state, numpy=False))]
+# 			states_joint = torch.cat([s.view(*s.size()[:-len(s_size)], np.prod(s_size)) for s,s_size in zip(states, self.state_size)], dim=-1)
+# 			actions_one_hot = [one_hot(a) for a in actions]
+# 			actions_one_hot_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(actions_one_hot, self.action_size)], dim=-1)
+# 			last_actions = [torch.cat([torch.zeros_like(a[0:1]), a[:-1]], dim=0) for a in actions_one_hot]
+# 			last_actions_joint = torch.cat([a.view(*a.shape[:-len(a_size)], np.prod(a_size)) for a,a_size in zip(last_actions, self.action_size)], dim=-1)
+# 			agent_mask = [(1-torch.eye(n_agent)).view(-1, 1).repeat(1, a_size[-1]).view(n_agent, -1) for a_size,n_agent in zip(self.action_size, n_agents)]
+# 			action_mask = torch.ones([1, 1, np.sum(n_agents), np.sum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, n_agents)])])
+# 			cols, rows = [0, *np.cumsum(n_agents)], [0, *np.cumsum([n_agent*a_size[-1] for a_size,n_agent in zip(self.action_size, n_agents)])]
+# 			for i,mask in enumerate(agent_mask): action_mask[...,cols[i]:cols[i+1], rows[i]:rows[i+1]] = mask
+
+# 			states_joint, actions_joint, last_actions_joint = [x.unsqueeze(-2).repeat_interleave(action_mask.shape[-2], dim=-2) for x in [states_joint, actions_one_hot_joint, last_actions_joint]]
+# 			joint_inputs = torch.cat([states_joint, actions_joint * action_mask, last_actions_joint], dim=-1).split(n_agents, dim=-2)
+# 			agent_ids = [torch.eye(self.network.n_agents(a_size)).unsqueeze(0).unsqueeze(0).expand(*a.shape[:2], -1, -1) for a_size, a in zip(self.action_size, actions)]
+# 			critic_inputs = [torch.cat([joint_input, state, agent_id], dim=-1) for joint_input,state,agent_id in zip(joint_inputs, states, agent_ids)]
+# 			actor_inputs = [torch.cat([state, last_action, agent_id], dim=-1) for state,last_action,agent_id in zip(states, last_actions, agent_ids)]
+
+# 			q_values = self.network.get_value(critic_inputs, grad=False)
+# 			q_selecteds = [torch.gather(q_value, dim=-1, index=a.argmax(-1, keepdims=True)).squeeze(-1) for q_value,a in zip(q_values,actions)]
+# 			q_targets = [self.compute_gae(q_selected[-1], reward.unsqueeze(-1), done.unsqueeze(-1), q_selected[:-1])[0] for q_selected,reward,done in zip(q_selecteds, rewards, dones)]
+# 			self.network.optimize(actions, actor_inputs, critic_inputs, q_values, q_targets)
+# 		if np.any(done[0]): self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0003           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 256				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 512				# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.998			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.001               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 1000000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+# import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.sac import SACAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-3]
+env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False, reward_shape=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward: [(ballr(o[0,88], o[0,89]) + o[0,95]-o[0,96] + 2*r)/4 for o,r in zip(obs,reward)]
+	return FootballTeamEnv(ggym, env_name, reward_fn if reward_shape else None)
+
+def run(model, steps=10000, ports=16, env_name=env_name, trial_at=100, save_at=10, checkpoint=True, save_best=False, log=True, render=False, reward_shape=False, icm=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name, reward_shape=reward_shape), ports)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=icm) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), reward_shape=reward_shape, icm=icm)
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})", agent.get_stats())
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}", agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {np.mean([rollout(envs.env, agent, eps=0.0, render=True) for _ in range(5)], axis=0)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[4], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="coma", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=200000, help="Number of steps to train the agent")
+	parser.add_argument("--reward_shape", action="store_true", help="Whether to shape rewards for football")
+	parser.add_argument("--icm", action="store_true", help="Whether to use intrinsic motivation")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.trial:
+		trial(model=model, env_name=env_name, render=args.render)
+	elif args.selfport is not None or MPI_RANK>0 :
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	else:
+		run(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)
+
+
+Step:       0, Reward: [-485.481 -485.481 -485.481] [53.239], Avg: [-485.481 -485.481 -485.481] (1.0000) ({r_i: None, r_t: [-10.536 -10.536 -10.536], eps: 1.0})
+Step:     100, Reward: [-490.527 -490.527 -490.527] [97.805], Avg: [-488.004 -488.004 -488.004] (1.0000) ({r_i: None, r_t: [-1047.320 -1047.320 -1047.320], eps: 1.0})
+Step:     200, Reward: [-516.486 -516.486 -516.486] [73.289], Avg: [-497.498 -497.498 -497.498] (1.0000) ({r_i: None, r_t: [-1001.742 -1001.742 -1001.742], eps: 1.0})
+Step:     300, Reward: [-577.521 -577.521 -577.521] [92.082], Avg: [-517.504 -517.504 -517.504] (1.0000) ({r_i: None, r_t: [-1017.143 -1017.143 -1017.143], eps: 1.0})
+Step:     400, Reward: [-509.068 -509.068 -509.068] [121.347], Avg: [-515.817 -515.817 -515.817] (1.0000) ({r_i: None, r_t: [-969.762 -969.762 -969.762], eps: 1.0})
+Step:     500, Reward: [-448.063 -448.063 -448.063] [97.229], Avg: [-504.524 -504.524 -504.524] (1.0000) ({r_i: None, r_t: [-1066.675 -1066.675 -1066.675], eps: 1.0})
+Step:     600, Reward: [-550.240 -550.240 -550.240] [127.022], Avg: [-511.055 -511.055 -511.055] (1.0000) ({r_i: None, r_t: [-912.264 -912.264 -912.264], eps: 1.0})
+Step:     700, Reward: [-460.756 -460.756 -460.756] [37.161], Avg: [-504.768 -504.768 -504.768] (1.0000) ({r_i: None, r_t: [-868.150 -868.150 -868.150], eps: 1.0})
+Step:     800, Reward: [-464.026 -464.026 -464.026] [62.242], Avg: [-500.241 -500.241 -500.241] (1.0000) ({r_i: None, r_t: [-884.613 -884.613 -884.613], eps: 1.0})
+Step:     900, Reward: [-531.457 -531.457 -531.457] [54.279], Avg: [-503.363 -503.363 -503.363] (1.0000) ({r_i: None, r_t: [-966.186 -966.186 -966.186], eps: 1.0})
+Step:    1000, Reward: [-516.861 -516.861 -516.861] [143.048], Avg: [-504.590 -504.590 -504.590] (1.0000) ({r_i: None, r_t: [-938.069 -938.069 -938.069], eps: 1.0})
+Step:    1100, Reward: [-517.580 -517.580 -517.580] [103.999], Avg: [-505.672 -505.672 -505.672] (1.0000) ({r_i: None, r_t: [-988.063 -988.063 -988.063], eps: 1.0})
+Step:    1200, Reward: [-481.763 -481.763 -481.763] [49.869], Avg: [-503.833 -503.833 -503.833] (1.0000) ({r_i: None, r_t: [-1024.961 -1024.961 -1024.961], eps: 1.0})
+Step:    1300, Reward: [-574.325 -574.325 -574.325] [120.478], Avg: [-508.868 -508.868 -508.868] (1.0000) ({r_i: None, r_t: [-1139.575 -1139.575 -1139.575], eps: 1.0})
+Step:    1400, Reward: [-511.254 -511.254 -511.254] [67.926], Avg: [-509.027 -509.027 -509.027] (1.0000) ({r_i: None, r_t: [-901.140 -901.140 -901.140], eps: 1.0})
+Step:    1500, Reward: [-504.596 -504.596 -504.596] [90.655], Avg: [-508.750 -508.750 -508.750] (1.0000) ({r_i: None, r_t: [-968.282 -968.282 -968.282], eps: 1.0})
+Step:    1600, Reward: [-530.794 -530.794 -530.794] [62.514], Avg: [-510.047 -510.047 -510.047] (1.0000) ({r_i: None, r_t: [-955.550 -955.550 -955.550], eps: 1.0})
+Step:    1700, Reward: [-424.639 -424.639 -424.639] [44.241], Avg: [-505.302 -505.302 -505.302] (1.0000) ({r_i: None, r_t: [-1033.114 -1033.114 -1033.114], eps: 1.0})
+Step:    1800, Reward: [-496.259 -496.259 -496.259] [87.314], Avg: [-504.826 -504.826 -504.826] (1.0000) ({r_i: None, r_t: [-970.619 -970.619 -970.619], eps: 1.0})
+Step:    1900, Reward: [-649.313 -649.313 -649.313] [195.134], Avg: [-512.051 -512.051 -512.051] (1.0000) ({r_i: None, r_t: [-1004.787 -1004.787 -1004.787], eps: 1.0})
+Step:    2000, Reward: [-468.119 -468.119 -468.119] [73.223], Avg: [-509.959 -509.959 -509.959] (1.0000) ({r_i: None, r_t: [-1163.752 -1163.752 -1163.752], eps: 1.0})
+Step:    2100, Reward: [-501.043 -501.043 -501.043] [89.634], Avg: [-509.553 -509.553 -509.553] (1.0000) ({r_i: None, r_t: [-994.727 -994.727 -994.727], eps: 1.0})
+Step:    2200, Reward: [-523.518 -523.518 -523.518] [109.104], Avg: [-510.160 -510.160 -510.160] (1.0000) ({r_i: None, r_t: [-1085.599 -1085.599 -1085.599], eps: 1.0})
+Step:    2300, Reward: [-551.121 -551.121 -551.121] [93.238], Avg: [-511.867 -511.867 -511.867] (1.0000) ({r_i: None, r_t: [-930.478 -930.478 -930.478], eps: 1.0})
+Step:    2400, Reward: [-453.306 -453.306 -453.306] [71.213], Avg: [-509.525 -509.525 -509.525] (1.0000) ({r_i: None, r_t: [-940.106 -940.106 -940.106], eps: 1.0})
+Step:    2500, Reward: [-527.805 -527.805 -527.805] [112.535], Avg: [-510.228 -510.228 -510.228] (1.0000) ({r_i: None, r_t: [-1081.947 -1081.947 -1081.947], eps: 1.0})
+Step:    2600, Reward: [-504.340 -504.340 -504.340] [58.628], Avg: [-510.010 -510.010 -510.010] (1.0000) ({r_i: None, r_t: [-1051.524 -1051.524 -1051.524], eps: 1.0})
+Step:    2700, Reward: [-447.706 -447.706 -447.706] [70.200], Avg: [-507.785 -507.785 -507.785] (1.0000) ({r_i: None, r_t: [-1023.896 -1023.896 -1023.896], eps: 1.0})
+Step:    2800, Reward: [-594.936 -594.936 -594.936] [133.761], Avg: [-510.790 -510.790 -510.790] (1.0000) ({r_i: None, r_t: [-1041.758 -1041.758 -1041.758], eps: 1.0})
+Step:    2900, Reward: [-495.375 -495.375 -495.375] [29.169], Avg: [-510.276 -510.276 -510.276] (1.0000) ({r_i: None, r_t: [-978.116 -978.116 -978.116], eps: 1.0})
+Step:    3000, Reward: [-527.375 -527.375 -527.375] [88.508], Avg: [-510.828 -510.828 -510.828] (1.0000) ({r_i: None, r_t: [-1011.549 -1011.549 -1011.549], eps: 1.0})
+Step:    3100, Reward: [-456.209 -456.209 -456.209] [36.440], Avg: [-509.121 -509.121 -509.121] (1.0000) ({r_i: None, r_t: [-1019.450 -1019.450 -1019.450], eps: 1.0})
+Step:    3200, Reward: [-497.264 -497.264 -497.264] [55.937], Avg: [-508.761 -508.761 -508.761] (1.0000) ({r_i: None, r_t: [-1083.049 -1083.049 -1083.049], eps: 1.0})
+Step:    3300, Reward: [-424.752 -424.752 -424.752] [12.134], Avg: [-506.291 -506.291 -506.291] (1.0000) ({r_i: None, r_t: [-902.439 -902.439 -902.439], eps: 1.0})
+Step:    3400, Reward: [-464.109 -464.109 -464.109] [188.451], Avg: [-505.085 -505.085 -505.085] (1.0000) ({r_i: None, r_t: [-884.144 -884.144 -884.144], eps: 1.0})
+Step:    3500, Reward: [-511.519 -511.519 -511.519] [86.889], Avg: [-505.264 -505.264 -505.264] (1.0000) ({r_i: None, r_t: [-1052.904 -1052.904 -1052.904], eps: 1.0})
+Step:    3600, Reward: [-504.084 -504.084 -504.084] [102.908], Avg: [-505.232 -505.232 -505.232] (1.0000) ({r_i: None, r_t: [-900.390 -900.390 -900.390], eps: 1.0})
+Step:    3700, Reward: [-483.762 -483.762 -483.762] [98.157], Avg: [-504.667 -504.667 -504.667] (1.0000) ({r_i: None, r_t: [-922.509 -922.509 -922.509], eps: 1.0})
+Step:    3800, Reward: [-486.367 -486.367 -486.367] [77.948], Avg: [-504.198 -504.198 -504.198] (1.0000) ({r_i: None, r_t: [-928.334 -928.334 -928.334], eps: 1.0})
+Step:    3900, Reward: [-534.613 -534.613 -534.613] [165.095], Avg: [-504.958 -504.958 -504.958] (1.0000) ({r_i: None, r_t: [-1069.391 -1069.391 -1069.391], eps: 1.0})
+Step:    4000, Reward: [-580.010 -580.010 -580.010] [114.679], Avg: [-506.789 -506.789 -506.789] (1.0000) ({r_i: None, r_t: [-1002.320 -1002.320 -1002.320], eps: 1.0})
+Step:    4100, Reward: [-475.612 -475.612 -475.612] [50.688], Avg: [-506.047 -506.047 -506.047] (1.0000) ({r_i: None, r_t: [-910.599 -910.599 -910.599], eps: 1.0})
+Step:    4200, Reward: [-483.851 -483.851 -483.851] [91.097], Avg: [-505.530 -505.530 -505.530] (1.0000) ({r_i: None, r_t: [-919.998 -919.998 -919.998], eps: 1.0})
+Step:    4300, Reward: [-503.888 -503.888 -503.888] [76.993], Avg: [-505.493 -505.493 -505.493] (1.0000) ({r_i: None, r_t: [-982.403 -982.403 -982.403], eps: 1.0})
+Step:    4400, Reward: [-527.873 -527.873 -527.873] [109.084], Avg: [-505.990 -505.990 -505.990] (1.0000) ({r_i: None, r_t: [-1035.775 -1035.775 -1035.775], eps: 1.0})
+Step:    4500, Reward: [-502.117 -502.117 -502.117] [101.810], Avg: [-505.906 -505.906 -505.906] (1.0000) ({r_i: None, r_t: [-1027.736 -1027.736 -1027.736], eps: 1.0})
+Step:    4600, Reward: [-509.529 -509.529 -509.529] [60.140], Avg: [-505.983 -505.983 -505.983] (1.0000) ({r_i: None, r_t: [-991.971 -991.971 -991.971], eps: 1.0})
+Step:    4700, Reward: [-553.516 -553.516 -553.516] [233.025], Avg: [-506.974 -506.974 -506.974] (1.0000) ({r_i: None, r_t: [-1079.476 -1079.476 -1079.476], eps: 1.0})
+Step:    4800, Reward: [-502.682 -502.682 -502.682] [104.927], Avg: [-506.886 -506.886 -506.886] (1.0000) ({r_i: None, r_t: [-1055.501 -1055.501 -1055.501], eps: 1.0})
+Step:    4900, Reward: [-453.209 -453.209 -453.209] [34.372], Avg: [-505.812 -505.812 -505.812] (1.0000) ({r_i: None, r_t: [-999.556 -999.556 -999.556], eps: 1.0})
+Step:    5000, Reward: [-491.224 -491.224 -491.224] [49.826], Avg: [-505.526 -505.526 -505.526] (1.0000) ({r_i: None, r_t: [-997.655 -997.655 -997.655], eps: 1.0})
+Step:    5100, Reward: [-468.070 -468.070 -468.070] [100.762], Avg: [-504.806 -504.806 -504.806] (1.0000) ({r_i: None, r_t: [-1021.060 -1021.060 -1021.060], eps: 1.0})
+Step:    5200, Reward: [-447.425 -447.425 -447.425] [102.685], Avg: [-503.723 -503.723 -503.723] (1.0000) ({r_i: None, r_t: [-1010.335 -1010.335 -1010.335], eps: 1.0})
+Step:    5300, Reward: [-494.047 -494.047 -494.047] [132.928], Avg: [-503.544 -503.544 -503.544] (1.0000) ({r_i: None, r_t: [-871.227 -871.227 -871.227], eps: 1.0})
+Step:    5400, Reward: [-498.003 -498.003 -498.003] [88.346], Avg: [-503.443 -503.443 -503.443] (1.0000) ({r_i: None, r_t: [-887.066 -887.066 -887.066], eps: 1.0})
+Step:    5500, Reward: [-521.687 -521.687 -521.687] [108.396], Avg: [-503.769 -503.769 -503.769] (1.0000) ({r_i: None, r_t: [-1071.233 -1071.233 -1071.233], eps: 1.0})
+Step:    5600, Reward: [-500.081 -500.081 -500.081] [50.449], Avg: [-503.705 -503.705 -503.705] (1.0000) ({r_i: None, r_t: [-928.926 -928.926 -928.926], eps: 1.0})
+Step:    5700, Reward: [-614.518 -614.518 -614.518] [63.265], Avg: [-505.615 -505.615 -505.615] (1.0000) ({r_i: None, r_t: [-988.514 -988.514 -988.514], eps: 1.0})
+Step:    5800, Reward: [-577.703 -577.703 -577.703] [92.596], Avg: [-506.837 -506.837 -506.837] (1.0000) ({r_i: None, r_t: [-981.195 -981.195 -981.195], eps: 1.0})
+Step:    5900, Reward: [-506.710 -506.710 -506.710] [64.770], Avg: [-506.835 -506.835 -506.835] (1.0000) ({r_i: None, r_t: [-1068.109 -1068.109 -1068.109], eps: 1.0})
+Step:    6000, Reward: [-445.736 -445.736 -445.736] [45.071], Avg: [-505.833 -505.833 -505.833] (1.0000) ({r_i: None, r_t: [-1024.273 -1024.273 -1024.273], eps: 1.0})
+Step:    6100, Reward: [-515.962 -515.962 -515.962] [129.447], Avg: [-505.997 -505.997 -505.997] (1.0000) ({r_i: None, r_t: [-1073.898 -1073.898 -1073.898], eps: 1.0})
+Step:    6200, Reward: [-577.936 -577.936 -577.936] [70.094], Avg: [-507.138 -507.138 -507.138] (1.0000) ({r_i: None, r_t: [-1034.638 -1034.638 -1034.638], eps: 1.0})
+Step:    6300, Reward: [-480.047 -480.047 -480.047] [60.037], Avg: [-506.715 -506.715 -506.715] (1.0000) ({r_i: None, r_t: [-986.160 -986.160 -986.160], eps: 1.0})
+Step:    6400, Reward: [-413.301 -413.301 -413.301] [33.173], Avg: [-505.278 -505.278 -505.278] (1.0000) ({r_i: None, r_t: [-1002.328 -1002.328 -1002.328], eps: 1.0})
+Step:    6500, Reward: [-487.308 -487.308 -487.308] [102.306], Avg: [-505.006 -505.006 -505.006] (1.0000) ({r_i: None, r_t: [-954.364 -954.364 -954.364], eps: 1.0})
+Step:    6600, Reward: [-597.073 -597.073 -597.073] [170.959], Avg: [-506.380 -506.380 -506.380] (1.0000) ({r_i: None, r_t: [-1183.231 -1183.231 -1183.231], eps: 1.0})
+Step:    6700, Reward: [-483.723 -483.723 -483.723] [111.964], Avg: [-506.047 -506.047 -506.047] (1.0000) ({r_i: None, r_t: [-1055.377 -1055.377 -1055.377], eps: 1.0})
+Step:    6800, Reward: [-519.027 -519.027 -519.027] [75.977], Avg: [-506.235 -506.235 -506.235] (1.0000) ({r_i: None, r_t: [-1093.984 -1093.984 -1093.984], eps: 1.0})
+Step:    6900, Reward: [-409.556 -409.556 -409.556] [58.655], Avg: [-504.854 -504.854 -504.854] (1.0000) ({r_i: None, r_t: [-1014.721 -1014.721 -1014.721], eps: 1.0})
+Step:    7000, Reward: [-464.030 -464.030 -464.030] [16.444], Avg: [-504.279 -504.279 -504.279] (1.0000) ({r_i: None, r_t: [-1013.702 -1013.702 -1013.702], eps: 1.0})
+Step:    7100, Reward: [-455.854 -455.854 -455.854] [95.928], Avg: [-503.606 -503.606 -503.606] (1.0000) ({r_i: None, r_t: [-991.251 -991.251 -991.251], eps: 1.0})
+Step:    7200, Reward: [-619.069 -619.069 -619.069] [176.921], Avg: [-505.188 -505.188 -505.188] (1.0000) ({r_i: None, r_t: [-944.958 -944.958 -944.958], eps: 1.0})
+Step:    7300, Reward: [-451.657 -451.657 -451.657] [51.191], Avg: [-504.464 -504.464 -504.464] (1.0000) ({r_i: None, r_t: [-948.976 -948.976 -948.976], eps: 1.0})
+Step:    7400, Reward: [-521.217 -521.217 -521.217] [160.335], Avg: [-504.688 -504.688 -504.688] (1.0000) ({r_i: None, r_t: [-975.282 -975.282 -975.282], eps: 1.0})
+Step:    7500, Reward: [-494.540 -494.540 -494.540] [56.730], Avg: [-504.554 -504.554 -504.554] (1.0000) ({r_i: None, r_t: [-1214.950 -1214.950 -1214.950], eps: 1.0})
+Step:    7600, Reward: [-494.641 -494.641 -494.641] [61.865], Avg: [-504.426 -504.426 -504.426] (1.0000) ({r_i: None, r_t: [-893.608 -893.608 -893.608], eps: 1.0})
+Step:    7700, Reward: [-466.222 -466.222 -466.222] [38.503], Avg: [-503.936 -503.936 -503.936] (1.0000) ({r_i: None, r_t: [-1006.485 -1006.485 -1006.485], eps: 1.0})
+Step:    7800, Reward: [-425.173 -425.173 -425.173] [39.290], Avg: [-502.939 -502.939 -502.939] (1.0000) ({r_i: None, r_t: [-1030.425 -1030.425 -1030.425], eps: 1.0})
+Step:    7900, Reward: [-530.224 -530.224 -530.224] [93.198], Avg: [-503.280 -503.280 -503.280] (1.0000) ({r_i: None, r_t: [-1023.544 -1023.544 -1023.544], eps: 1.0})
+Step:    8000, Reward: [-497.127 -497.127 -497.127] [83.943], Avg: [-503.204 -503.204 -503.204] (1.0000) ({r_i: None, r_t: [-967.951 -967.951 -967.951], eps: 1.0})
+Step:    8100, Reward: [-491.067 -491.067 -491.067] [80.954], Avg: [-503.056 -503.056 -503.056] (1.0000) ({r_i: None, r_t: [-1086.659 -1086.659 -1086.659], eps: 1.0})
+Step:    8200, Reward: [-506.234 -506.234 -506.234] [71.024], Avg: [-503.094 -503.094 -503.094] (1.0000) ({r_i: None, r_t: [-957.992 -957.992 -957.992], eps: 1.0})
+Step:    8300, Reward: [-442.630 -442.630 -442.630] [21.648], Avg: [-502.374 -502.374 -502.374] (1.0000) ({r_i: None, r_t: [-1012.934 -1012.934 -1012.934], eps: 1.0})
+Step:    8400, Reward: [-519.834 -519.834 -519.834] [186.904], Avg: [-502.580 -502.580 -502.580] (1.0000) ({r_i: None, r_t: [-873.102 -873.102 -873.102], eps: 1.0})
+Step:    8500, Reward: [-603.949 -603.949 -603.949] [259.309], Avg: [-503.758 -503.758 -503.758] (1.0000) ({r_i: None, r_t: [-1058.417 -1058.417 -1058.417], eps: 1.0})
+Step:    8600, Reward: [-553.428 -553.428 -553.428] [171.763], Avg: [-504.329 -504.329 -504.329] (1.0000) ({r_i: None, r_t: [-1091.953 -1091.953 -1091.953], eps: 1.0})
+Step:    8700, Reward: [-448.706 -448.706 -448.706] [50.633], Avg: [-503.697 -503.697 -503.697] (1.0000) ({r_i: None, r_t: [-1030.664 -1030.664 -1030.664], eps: 1.0})
+Step:    8800, Reward: [-466.505 -466.505 -466.505] [61.725], Avg: [-503.279 -503.279 -503.279] (1.0000) ({r_i: None, r_t: [-1024.751 -1024.751 -1024.751], eps: 1.0})
+Step:    8900, Reward: [-436.354 -436.354 -436.354] [19.745], Avg: [-502.536 -502.536 -502.536] (1.0000) ({r_i: None, r_t: [-1084.043 -1084.043 -1084.043], eps: 1.0})
+Step:    9000, Reward: [-570.794 -570.794 -570.794] [201.983], Avg: [-503.286 -503.286 -503.286] (1.0000) ({r_i: None, r_t: [-949.854 -949.854 -949.854], eps: 1.0})
+Step:    9100, Reward: [-407.758 -407.758 -407.758] [51.153], Avg: [-502.248 -502.248 -502.248] (1.0000) ({r_i: None, r_t: [-1014.801 -1014.801 -1014.801], eps: 1.0})
+Step:    9200, Reward: [-528.033 -528.033 -528.033] [49.098], Avg: [-502.525 -502.525 -502.525] (1.0000) ({r_i: None, r_t: [-1061.715 -1061.715 -1061.715], eps: 1.0})
+Step:    9300, Reward: [-552.460 -552.460 -552.460] [153.047], Avg: [-503.056 -503.056 -503.056] (1.0000) ({r_i: None, r_t: [-970.441 -970.441 -970.441], eps: 1.0})
+Step:    9400, Reward: [-527.542 -527.542 -527.542] [59.052], Avg: [-503.314 -503.314 -503.314] (1.0000) ({r_i: None, r_t: [-902.439 -902.439 -902.439], eps: 1.0})
+Step:    9500, Reward: [-498.952 -498.952 -498.952] [110.950], Avg: [-503.268 -503.268 -503.268] (1.0000) ({r_i: None, r_t: [-1099.775 -1099.775 -1099.775], eps: 1.0})
+Step:    9600, Reward: [-508.923 -508.923 -508.923] [54.424], Avg: [-503.327 -503.327 -503.327] (1.0000) ({r_i: None, r_t: [-991.518 -991.518 -991.518], eps: 1.0})
+Step:    9700, Reward: [-493.914 -493.914 -493.914] [81.125], Avg: [-503.231 -503.231 -503.231] (1.0000) ({r_i: None, r_t: [-1182.675 -1182.675 -1182.675], eps: 1.0})
+Step:    9800, Reward: [-496.932 -496.932 -496.932] [111.689], Avg: [-503.167 -503.167 -503.167] (1.0000) ({r_i: None, r_t: [-1003.662 -1003.662 -1003.662], eps: 1.0})
+Step:    9900, Reward: [-656.861 -656.861 -656.861] [40.623], Avg: [-504.704 -504.704 -504.704] (1.0000) ({r_i: None, r_t: [-1079.546 -1079.546 -1079.546], eps: 1.0})
+Step:   10000, Reward: [-460.276 -460.276 -460.276] [105.439], Avg: [-504.264 -504.264 -504.264] (1.0000) ({r_i: None, r_t: [-931.879 -931.879 -931.879], eps: 1.0})
+Step:   10100, Reward: [-473.639 -473.639 -473.639] [64.342], Avg: [-503.964 -503.964 -503.964] (1.0000) ({r_i: None, r_t: [-1041.709 -1041.709 -1041.709], eps: 1.0})
+Step:   10200, Reward: [-652.277 -652.277 -652.277] [46.625], Avg: [-505.404 -505.404 -505.404] (1.0000) ({r_i: None, r_t: [-970.534 -970.534 -970.534], eps: 1.0})
+Step:   10300, Reward: [-523.209 -523.209 -523.209] [76.415], Avg: [-505.575 -505.575 -505.575] (1.0000) ({r_i: None, r_t: [-1031.553 -1031.553 -1031.553], eps: 1.0})
+Step:   10400, Reward: [-387.368 -387.368 -387.368] [66.122], Avg: [-504.449 -504.449 -504.449] (1.0000) ({r_i: None, r_t: [-982.593 -982.593 -982.593], eps: 1.0})
+Step:   10500, Reward: [-519.795 -519.795 -519.795] [42.806], Avg: [-504.594 -504.594 -504.594] (1.0000) ({r_i: None, r_t: [-1085.372 -1085.372 -1085.372], eps: 1.0})
+Step:   10600, Reward: [-531.649 -531.649 -531.649] [56.741], Avg: [-504.847 -504.847 -504.847] (1.0000) ({r_i: None, r_t: [-1016.769 -1016.769 -1016.769], eps: 1.0})
+Step:   10700, Reward: [-501.272 -501.272 -501.272] [124.937], Avg: [-504.814 -504.814 -504.814] (1.0000) ({r_i: None, r_t: [-982.678 -982.678 -982.678], eps: 1.0})
+Step:   10800, Reward: [-490.800 -490.800 -490.800] [39.809], Avg: [-504.685 -504.685 -504.685] (1.0000) ({r_i: None, r_t: [-918.212 -918.212 -918.212], eps: 1.0})
+Step:   10900, Reward: [-569.507 -569.507 -569.507] [140.940], Avg: [-505.274 -505.274 -505.274] (1.0000) ({r_i: None, r_t: [-1082.303 -1082.303 -1082.303], eps: 1.0})
+Step:   11000, Reward: [-448.787 -448.787 -448.787] [66.406], Avg: [-504.766 -504.766 -504.766] (1.0000) ({r_i: None, r_t: [-934.077 -934.077 -934.077], eps: 1.0})
+Step:   11100, Reward: [-566.886 -566.886 -566.886] [47.976], Avg: [-505.320 -505.320 -505.320] (1.0000) ({r_i: None, r_t: [-1148.150 -1148.150 -1148.150], eps: 1.0})
+Step:   11200, Reward: [-466.036 -466.036 -466.036] [72.288], Avg: [-504.972 -504.972 -504.972] (1.0000) ({r_i: None, r_t: [-1005.750 -1005.750 -1005.750], eps: 1.0})
+Step:   11300, Reward: [-547.120 -547.120 -547.120] [101.918], Avg: [-505.342 -505.342 -505.342] (1.0000) ({r_i: None, r_t: [-1119.873 -1119.873 -1119.873], eps: 1.0})
+Step:   11400, Reward: [-489.360 -489.360 -489.360] [112.213], Avg: [-505.203 -505.203 -505.203] (1.0000) ({r_i: None, r_t: [-924.723 -924.723 -924.723], eps: 1.0})
+Step:   11500, Reward: [-482.307 -482.307 -482.307] [55.289], Avg: [-505.006 -505.006 -505.006] (1.0000) ({r_i: None, r_t: [-988.829 -988.829 -988.829], eps: 1.0})
+Step:   11600, Reward: [-490.262 -490.262 -490.262] [108.676], Avg: [-504.880 -504.880 -504.880] (1.0000) ({r_i: None, r_t: [-1011.791 -1011.791 -1011.791], eps: 1.0})
+Step:   11700, Reward: [-462.492 -462.492 -462.492] [65.850], Avg: [-504.521 -504.521 -504.521] (1.0000) ({r_i: None, r_t: [-1264.981 -1264.981 -1264.981], eps: 1.0})
+Step:   11800, Reward: [-518.005 -518.005 -518.005] [41.816], Avg: [-504.634 -504.634 -504.634] (1.0000) ({r_i: None, r_t: [-1084.664 -1084.664 -1084.664], eps: 1.0})
+Step:   11900, Reward: [-533.454 -533.454 -533.454] [104.848], Avg: [-504.874 -504.874 -504.874] (1.0000) ({r_i: None, r_t: [-934.539 -934.539 -934.539], eps: 1.0})
+Step:   12000, Reward: [-493.083 -493.083 -493.083] [89.312], Avg: [-504.777 -504.777 -504.777] (1.0000) ({r_i: None, r_t: [-1040.878 -1040.878 -1040.878], eps: 1.0})
+Step:   12100, Reward: [-472.494 -472.494 -472.494] [47.758], Avg: [-504.512 -504.512 -504.512] (1.0000) ({r_i: None, r_t: [-936.942 -936.942 -936.942], eps: 1.0})
+Step:   12200, Reward: [-565.986 -565.986 -565.986] [161.250], Avg: [-505.012 -505.012 -505.012] (1.0000) ({r_i: None, r_t: [-1116.123 -1116.123 -1116.123], eps: 1.0})
+Step:   12300, Reward: [-483.336 -483.336 -483.336] [59.039], Avg: [-504.837 -504.837 -504.837] (1.0000) ({r_i: None, r_t: [-1013.194 -1013.194 -1013.194], eps: 1.0})
+Step:   12400, Reward: [-500.421 -500.421 -500.421] [190.579], Avg: [-504.802 -504.802 -504.802] (1.0000) ({r_i: None, r_t: [-978.172 -978.172 -978.172], eps: 1.0})
+Step:   12500, Reward: [-507.807 -507.807 -507.807] [173.557], Avg: [-504.826 -504.826 -504.826] (1.0000) ({r_i: None, r_t: [-1114.445 -1114.445 -1114.445], eps: 1.0})
+Step:   12600, Reward: [-473.195 -473.195 -473.195] [17.429], Avg: [-504.576 -504.576 -504.576] (1.0000) ({r_i: None, r_t: [-1013.997 -1013.997 -1013.997], eps: 1.0})
+Step:   12700, Reward: [-468.557 -468.557 -468.557] [103.638], Avg: [-504.295 -504.295 -504.295] (1.0000) ({r_i: None, r_t: [-1159.123 -1159.123 -1159.123], eps: 1.0})
+Step:   12800, Reward: [-432.013 -432.013 -432.013] [14.685], Avg: [-503.735 -503.735 -503.735] (1.0000) ({r_i: None, r_t: [-1117.087 -1117.087 -1117.087], eps: 1.0})
+Step:   12900, Reward: [-507.354 -507.354 -507.354] [113.927], Avg: [-503.763 -503.763 -503.763] (1.0000) ({r_i: None, r_t: [-962.510 -962.510 -962.510], eps: 1.0})
+Step:   13000, Reward: [-488.979 -488.979 -488.979] [48.859], Avg: [-503.650 -503.650 -503.650] (1.0000) ({r_i: None, r_t: [-931.371 -931.371 -931.371], eps: 1.0})
+Step:   13100, Reward: [-494.364 -494.364 -494.364] [140.318], Avg: [-503.579 -503.579 -503.579] (1.0000) ({r_i: None, r_t: [-872.904 -872.904 -872.904], eps: 1.0})
+Step:   13200, Reward: [-536.414 -536.414 -536.414] [88.865], Avg: [-503.826 -503.826 -503.826] (1.0000) ({r_i: None, r_t: [-1103.701 -1103.701 -1103.701], eps: 1.0})
+Step:   13300, Reward: [-561.769 -561.769 -561.769] [112.876], Avg: [-504.259 -504.259 -504.259] (1.0000) ({r_i: None, r_t: [-1158.939 -1158.939 -1158.939], eps: 1.0})
+Step:   13400, Reward: [-516.292 -516.292 -516.292] [39.155], Avg: [-504.348 -504.348 -504.348] (1.0000) ({r_i: None, r_t: [-946.558 -946.558 -946.558], eps: 1.0})
+Step:   13500, Reward: [-461.714 -461.714 -461.714] [47.158], Avg: [-504.034 -504.034 -504.034] (1.0000) ({r_i: None, r_t: [-951.279 -951.279 -951.279], eps: 1.0})
+Step:   13600, Reward: [-410.149 -410.149 -410.149] [47.065], Avg: [-503.349 -503.349 -503.349] (1.0000) ({r_i: None, r_t: [-1010.297 -1010.297 -1010.297], eps: 1.0})
+Step:   13700, Reward: [-419.347 -419.347 -419.347] [37.336], Avg: [-502.740 -502.740 -502.740] (1.0000) ({r_i: None, r_t: [-991.220 -991.220 -991.220], eps: 1.0})
+Step:   13800, Reward: [-464.749 -464.749 -464.749] [108.646], Avg: [-502.467 -502.467 -502.467] (1.0000) ({r_i: None, r_t: [-1045.266 -1045.266 -1045.266], eps: 1.0})
+Step:   13900, Reward: [-440.741 -440.741 -440.741] [40.038], Avg: [-502.026 -502.026 -502.026] (1.0000) ({r_i: None, r_t: [-1201.064 -1201.064 -1201.064], eps: 1.0})
+Step:   14000, Reward: [-528.385 -528.385 -528.385] [97.916], Avg: [-502.213 -502.213 -502.213] (1.0000) ({r_i: None, r_t: [-1003.035 -1003.035 -1003.035], eps: 1.0})
+Step:   14100, Reward: [-447.193 -447.193 -447.193] [36.310], Avg: [-501.826 -501.826 -501.826] (1.0000) ({r_i: None, r_t: [-919.013 -919.013 -919.013], eps: 1.0})
+Step:   14200, Reward: [-569.777 -569.777 -569.777] [124.251], Avg: [-502.301 -502.301 -502.301] (1.0000) ({r_i: None, r_t: [-892.316 -892.316 -892.316], eps: 1.0})
+Step:   14300, Reward: [-483.384 -483.384 -483.384] [54.949], Avg: [-502.169 -502.169 -502.169] (1.0000) ({r_i: None, r_t: [-1155.734 -1155.734 -1155.734], eps: 1.0})
+Step:   14400, Reward: [-587.216 -587.216 -587.216] [44.160], Avg: [-502.756 -502.756 -502.756] (1.0000) ({r_i: None, r_t: [-1024.587 -1024.587 -1024.587], eps: 1.0})
+Step:   14500, Reward: [-514.538 -514.538 -514.538] [25.060], Avg: [-502.837 -502.837 -502.837] (1.0000) ({r_i: None, r_t: [-1026.621 -1026.621 -1026.621], eps: 1.0})
+Step:   14600, Reward: [-540.220 -540.220 -540.220] [162.682], Avg: [-503.091 -503.091 -503.091] (1.0000) ({r_i: None, r_t: [-1041.381 -1041.381 -1041.381], eps: 1.0})
+Step:   14700, Reward: [-444.915 -444.915 -444.915] [37.478], Avg: [-502.698 -502.698 -502.698] (1.0000) ({r_i: None, r_t: [-1125.526 -1125.526 -1125.526], eps: 1.0})
+Step:   14800, Reward: [-443.672 -443.672 -443.672] [62.650], Avg: [-502.302 -502.302 -502.302] (1.0000) ({r_i: None, r_t: [-1087.131 -1087.131 -1087.131], eps: 1.0})
+Step:   14900, Reward: [-542.634 -542.634 -542.634] [64.838], Avg: [-502.571 -502.571 -502.571] (1.0000) ({r_i: None, r_t: [-972.768 -972.768 -972.768], eps: 1.0})
+Step:   15000, Reward: [-479.154 -479.154 -479.154] [30.940], Avg: [-502.416 -502.416 -502.416] (1.0000) ({r_i: None, r_t: [-986.489 -986.489 -986.489], eps: 1.0})
+Step:   15100, Reward: [-500.674 -500.674 -500.674] [135.245], Avg: [-502.404 -502.404 -502.404] (1.0000) ({r_i: None, r_t: [-1101.263 -1101.263 -1101.263], eps: 1.0})
+Step:   15200, Reward: [-472.796 -472.796 -472.796] [85.163], Avg: [-502.211 -502.211 -502.211] (1.0000) ({r_i: None, r_t: [-1040.722 -1040.722 -1040.722], eps: 1.0})
+Step:   15300, Reward: [-449.073 -449.073 -449.073] [92.212], Avg: [-501.866 -501.866 -501.866] (1.0000) ({r_i: None, r_t: [-1085.584 -1085.584 -1085.584], eps: 1.0})
+Step:   15400, Reward: [-527.898 -527.898 -527.898] [63.297], Avg: [-502.033 -502.033 -502.033] (1.0000) ({r_i: None, r_t: [-960.926 -960.926 -960.926], eps: 1.0})
+Step:   15500, Reward: [-446.902 -446.902 -446.902] [62.783], Avg: [-501.680 -501.680 -501.680] (1.0000) ({r_i: None, r_t: [-1024.408 -1024.408 -1024.408], eps: 1.0})
+Step:   15600, Reward: [-515.486 -515.486 -515.486] [57.732], Avg: [-501.768 -501.768 -501.768] (1.0000) ({r_i: None, r_t: [-992.446 -992.446 -992.446], eps: 1.0})
+Step:   15700, Reward: [-498.872 -498.872 -498.872] [27.958], Avg: [-501.750 -501.750 -501.750] (1.0000) ({r_i: None, r_t: [-963.975 -963.975 -963.975], eps: 1.0})
+Step:   15800, Reward: [-584.379 -584.379 -584.379] [74.939], Avg: [-502.269 -502.269 -502.269] (1.0000) ({r_i: None, r_t: [-1064.624 -1064.624 -1064.624], eps: 1.0})
+Step:   15900, Reward: [-555.307 -555.307 -555.307] [89.207], Avg: [-502.601 -502.601 -502.601] (1.0000) ({r_i: None, r_t: [-1000.367 -1000.367 -1000.367], eps: 1.0})
+Step:   16000, Reward: [-594.448 -594.448 -594.448] [178.795], Avg: [-503.171 -503.171 -503.171] (1.0000) ({r_i: None, r_t: [-1121.083 -1121.083 -1121.083], eps: 1.0})
+Step:   16100, Reward: [-465.649 -465.649 -465.649] [55.984], Avg: [-502.940 -502.940 -502.940] (1.0000) ({r_i: None, r_t: [-993.700 -993.700 -993.700], eps: 1.0})
+Step:   16200, Reward: [-440.692 -440.692 -440.692] [62.541], Avg: [-502.558 -502.558 -502.558] (1.0000) ({r_i: None, r_t: [-1167.130 -1167.130 -1167.130], eps: 1.0})
+Step:   16300, Reward: [-548.689 -548.689 -548.689] [70.768], Avg: [-502.839 -502.839 -502.839] (1.0000) ({r_i: None, r_t: [-1030.910 -1030.910 -1030.910], eps: 1.0})
+Step:   16400, Reward: [-524.911 -524.911 -524.911] [80.099], Avg: [-502.973 -502.973 -502.973] (1.0000) ({r_i: None, r_t: [-923.507 -923.507 -923.507], eps: 1.0})
+Step:   16500, Reward: [-480.934 -480.934 -480.934] [63.060], Avg: [-502.840 -502.840 -502.840] (1.0000) ({r_i: None, r_t: [-1086.301 -1086.301 -1086.301], eps: 1.0})
+Step:   16600, Reward: [-467.352 -467.352 -467.352] [131.446], Avg: [-502.628 -502.628 -502.628] (1.0000) ({r_i: None, r_t: [-1008.320 -1008.320 -1008.320], eps: 1.0})
+Step:   16700, Reward: [-652.117 -652.117 -652.117] [62.731], Avg: [-503.517 -503.517 -503.517] (1.0000) ({r_i: None, r_t: [-1082.777 -1082.777 -1082.777], eps: 1.0})
+Step:   16800, Reward: [-514.740 -514.740 -514.740] [101.759], Avg: [-503.584 -503.584 -503.584] (1.0000) ({r_i: None, r_t: [-1034.384 -1034.384 -1034.384], eps: 1.0})
+Step:   16900, Reward: [-619.853 -619.853 -619.853] [125.070], Avg: [-504.268 -504.268 -504.268] (1.0000) ({r_i: None, r_t: [-1233.577 -1233.577 -1233.577], eps: 1.0})
+Step:   17000, Reward: [-572.731 -572.731 -572.731] [252.384], Avg: [-504.668 -504.668 -504.668] (1.0000) ({r_i: None, r_t: [-966.166 -966.166 -966.166], eps: 1.0})
+Step:   17100, Reward: [-418.867 -418.867 -418.867] [46.175], Avg: [-504.169 -504.169 -504.169] (1.0000) ({r_i: None, r_t: [-1123.261 -1123.261 -1123.261], eps: 1.0})
+Step:   17200, Reward: [-476.851 -476.851 -476.851] [88.110], Avg: [-504.011 -504.011 -504.011] (1.0000) ({r_i: None, r_t: [-1112.050 -1112.050 -1112.050], eps: 1.0})
+Step:   17300, Reward: [-588.938 -588.938 -588.938] [131.293], Avg: [-504.499 -504.499 -504.499] (1.0000) ({r_i: None, r_t: [-946.895 -946.895 -946.895], eps: 1.0})
+Step:   17400, Reward: [-492.171 -492.171 -492.171] [91.029], Avg: [-504.429 -504.429 -504.429] (1.0000) ({r_i: None, r_t: [-897.294 -897.294 -897.294], eps: 1.0})
+Step:   17500, Reward: [-478.884 -478.884 -478.884] [129.746], Avg: [-504.284 -504.284 -504.284] (1.0000) ({r_i: None, r_t: [-941.630 -941.630 -941.630], eps: 1.0})
+Step:   17600, Reward: [-590.157 -590.157 -590.157] [277.662], Avg: [-504.769 -504.769 -504.769] (1.0000) ({r_i: None, r_t: [-1062.107 -1062.107 -1062.107], eps: 1.0})
+Step:   17700, Reward: [-431.092 -431.092 -431.092] [25.258], Avg: [-504.355 -504.355 -504.355] (1.0000) ({r_i: None, r_t: [-970.551 -970.551 -970.551], eps: 1.0})
+Step:   17800, Reward: [-647.458 -647.458 -647.458] [185.900], Avg: [-505.155 -505.155 -505.155] (1.0000) ({r_i: None, r_t: [-1039.612 -1039.612 -1039.612], eps: 1.0})
+Step:   17900, Reward: [-509.028 -509.028 -509.028] [91.844], Avg: [-505.176 -505.176 -505.176] (1.0000) ({r_i: None, r_t: [-1002.807 -1002.807 -1002.807], eps: 1.0})
+Step:   18000, Reward: [-564.567 -564.567 -564.567] [151.568], Avg: [-505.504 -505.504 -505.504] (1.0000) ({r_i: None, r_t: [-963.645 -963.645 -963.645], eps: 1.0})
+Step:   18100, Reward: [-596.202 -596.202 -596.202] [126.790], Avg: [-506.003 -506.003 -506.003] (1.0000) ({r_i: None, r_t: [-1076.534 -1076.534 -1076.534], eps: 1.0})
+Step:   18200, Reward: [-467.338 -467.338 -467.338] [84.109], Avg: [-505.791 -505.791 -505.791] (1.0000) ({r_i: None, r_t: [-1044.033 -1044.033 -1044.033], eps: 1.0})
+Step:   18300, Reward: [-597.153 -597.153 -597.153] [253.293], Avg: [-506.288 -506.288 -506.288] (1.0000) ({r_i: None, r_t: [-1221.930 -1221.930 -1221.930], eps: 1.0})
+Step:   18400, Reward: [-420.238 -420.238 -420.238] [41.853], Avg: [-505.823 -505.823 -505.823] (1.0000) ({r_i: None, r_t: [-1137.176 -1137.176 -1137.176], eps: 1.0})
+Step:   18500, Reward: [-534.573 -534.573 -534.573] [106.947], Avg: [-505.977 -505.977 -505.977] (1.0000) ({r_i: None, r_t: [-1006.614 -1006.614 -1006.614], eps: 1.0})
+Step:   18600, Reward: [-519.667 -519.667 -519.667] [39.130], Avg: [-506.050 -506.050 -506.050] (1.0000) ({r_i: None, r_t: [-917.227 -917.227 -917.227], eps: 1.0})
+Step:   18700, Reward: [-526.249 -526.249 -526.249] [47.071], Avg: [-506.158 -506.158 -506.158] (1.0000) ({r_i: None, r_t: [-837.336 -837.336 -837.336], eps: 1.0})
+Step:   18800, Reward: [-499.271 -499.271 -499.271] [100.946], Avg: [-506.121 -506.121 -506.121] (1.0000) ({r_i: None, r_t: [-1053.475 -1053.475 -1053.475], eps: 1.0})
+Step:   18900, Reward: [-518.466 -518.466 -518.466] [29.392], Avg: [-506.186 -506.186 -506.186] (1.0000) ({r_i: None, r_t: [-1054.607 -1054.607 -1054.607], eps: 1.0})
+Step:   19000, Reward: [-423.468 -423.468 -423.468] [21.893], Avg: [-505.753 -505.753 -505.753] (1.0000) ({r_i: None, r_t: [-1212.392 -1212.392 -1212.392], eps: 1.0})
+Step:   19100, Reward: [-526.344 -526.344 -526.344] [52.204], Avg: [-505.861 -505.861 -505.861] (1.0000) ({r_i: None, r_t: [-987.895 -987.895 -987.895], eps: 1.0})
+Step:   19200, Reward: [-500.600 -500.600 -500.600] [58.203], Avg: [-505.833 -505.833 -505.833] (1.0000) ({r_i: None, r_t: [-1066.908 -1066.908 -1066.908], eps: 1.0})
+Step:   19300, Reward: [-505.348 -505.348 -505.348] [121.128], Avg: [-505.831 -505.831 -505.831] (1.0000) ({r_i: None, r_t: [-1024.192 -1024.192 -1024.192], eps: 1.0})
+Step:   19400, Reward: [-550.723 -550.723 -550.723] [103.140], Avg: [-506.061 -506.061 -506.061] (1.0000) ({r_i: None, r_t: [-1029.455 -1029.455 -1029.455], eps: 1.0})
+Step:   19500, Reward: [-432.270 -432.270 -432.270] [17.200], Avg: [-505.685 -505.685 -505.685] (1.0000) ({r_i: None, r_t: [-1126.252 -1126.252 -1126.252], eps: 1.0})
+Step:   19600, Reward: [-557.974 -557.974 -557.974] [69.025], Avg: [-505.950 -505.950 -505.950] (1.0000) ({r_i: None, r_t: [-1094.417 -1094.417 -1094.417], eps: 1.0})
+Step:   19700, Reward: [-511.788 -511.788 -511.788] [62.572], Avg: [-505.979 -505.979 -505.979] (1.0000) ({r_i: None, r_t: [-1149.434 -1149.434 -1149.434], eps: 1.0})
+Step:   19800, Reward: [-500.373 -500.373 -500.373] [159.133], Avg: [-505.951 -505.951 -505.951] (1.0000) ({r_i: None, r_t: [-1080.176 -1080.176 -1080.176], eps: 1.0})
+Step:   19900, Reward: [-576.166 -576.166 -576.166] [29.334], Avg: [-506.302 -506.302 -506.302] (1.0000) ({r_i: None, r_t: [-987.389 -987.389 -987.389], eps: 1.0})
+Step:   20000, Reward: [-491.990 -491.990 -491.990] [35.874], Avg: [-506.231 -506.231 -506.231] (1.0000) ({r_i: None, r_t: [-976.581 -976.581 -976.581], eps: 1.0})
+Step:   20100, Reward: [-562.220 -562.220 -562.220] [80.189], Avg: [-506.508 -506.508 -506.508] (1.0000) ({r_i: None, r_t: [-889.029 -889.029 -889.029], eps: 1.0})
+Step:   20200, Reward: [-428.988 -428.988 -428.988] [99.587], Avg: [-506.126 -506.126 -506.126] (1.0000) ({r_i: None, r_t: [-1050.912 -1050.912 -1050.912], eps: 1.0})
+Step:   20300, Reward: [-440.978 -440.978 -440.978] [36.887], Avg: [-505.807 -505.807 -505.807] (1.0000) ({r_i: None, r_t: [-1004.426 -1004.426 -1004.426], eps: 1.0})
+Step:   20400, Reward: [-587.827 -587.827 -587.827] [190.024], Avg: [-506.207 -506.207 -506.207] (1.0000) ({r_i: None, r_t: [-1117.376 -1117.376 -1117.376], eps: 1.0})
+Step:   20500, Reward: [-510.802 -510.802 -510.802] [62.025], Avg: [-506.230 -506.230 -506.230] (1.0000) ({r_i: None, r_t: [-1125.648 -1125.648 -1125.648], eps: 1.0})
+Step:   20600, Reward: [-517.250 -517.250 -517.250] [127.825], Avg: [-506.283 -506.283 -506.283] (1.0000) ({r_i: None, r_t: [-1120.299 -1120.299 -1120.299], eps: 1.0})
+Step:   20700, Reward: [-572.026 -572.026 -572.026] [106.186], Avg: [-506.599 -506.599 -506.599] (1.0000) ({r_i: None, r_t: [-1107.140 -1107.140 -1107.140], eps: 1.0})
+Step:   20800, Reward: [-551.511 -551.511 -551.511] [111.368], Avg: [-506.814 -506.814 -506.814] (1.0000) ({r_i: None, r_t: [-1073.649 -1073.649 -1073.649], eps: 1.0})
+Step:   20900, Reward: [-691.474 -691.474 -691.474] [78.411], Avg: [-507.693 -507.693 -507.693] (1.0000) ({r_i: None, r_t: [-1108.753 -1108.753 -1108.753], eps: 1.0})
+Step:   21000, Reward: [-624.654 -624.654 -624.654] [157.692], Avg: [-508.247 -508.247 -508.247] (1.0000) ({r_i: None, r_t: [-1030.867 -1030.867 -1030.867], eps: 1.0})
+Step:   21100, Reward: [-614.794 -614.794 -614.794] [112.886], Avg: [-508.750 -508.750 -508.750] (1.0000) ({r_i: None, r_t: [-1005.385 -1005.385 -1005.385], eps: 1.0})
+Step:   21200, Reward: [-598.698 -598.698 -598.698] [200.810], Avg: [-509.172 -509.172 -509.172] (1.0000) ({r_i: None, r_t: [-1028.016 -1028.016 -1028.016], eps: 1.0})
+Step:   21300, Reward: [-602.211 -602.211 -602.211] [45.492], Avg: [-509.607 -509.607 -509.607] (1.0000) ({r_i: None, r_t: [-938.612 -938.612 -938.612], eps: 1.0})
+Step:   21400, Reward: [-497.557 -497.557 -497.557] [124.795], Avg: [-509.551 -509.551 -509.551] (1.0000) ({r_i: None, r_t: [-1065.406 -1065.406 -1065.406], eps: 1.0})
+Step:   21500, Reward: [-519.029 -519.029 -519.029] [61.850], Avg: [-509.595 -509.595 -509.595] (1.0000) ({r_i: None, r_t: [-1025.283 -1025.283 -1025.283], eps: 1.0})
+Step:   21600, Reward: [-455.948 -455.948 -455.948] [35.129], Avg: [-509.348 -509.348 -509.348] (1.0000) ({r_i: None, r_t: [-921.197 -921.197 -921.197], eps: 1.0})
+Step:   21700, Reward: [-666.979 -666.979 -666.979] [188.013], Avg: [-510.071 -510.071 -510.071] (1.0000) ({r_i: None, r_t: [-1040.490 -1040.490 -1040.490], eps: 1.0})
+Step:   21800, Reward: [-517.389 -517.389 -517.389] [45.517], Avg: [-510.104 -510.104 -510.104] (1.0000) ({r_i: None, r_t: [-1054.257 -1054.257 -1054.257], eps: 1.0})
+Step:   21900, Reward: [-512.306 -512.306 -512.306] [74.225], Avg: [-510.114 -510.114 -510.114] (1.0000) ({r_i: None, r_t: [-917.988 -917.988 -917.988], eps: 1.0})
+Step:   22000, Reward: [-468.035 -468.035 -468.035] [20.470], Avg: [-509.924 -509.924 -509.924] (1.0000) ({r_i: None, r_t: [-957.504 -957.504 -957.504], eps: 1.0})
+Step:   22100, Reward: [-663.036 -663.036 -663.036] [186.514], Avg: [-510.613 -510.613 -510.613] (1.0000) ({r_i: None, r_t: [-1101.383 -1101.383 -1101.383], eps: 1.0})
+Step:   22200, Reward: [-648.334 -648.334 -648.334] [220.656], Avg: [-511.231 -511.231 -511.231] (1.0000) ({r_i: None, r_t: [-1211.121 -1211.121 -1211.121], eps: 1.0})
+Step:   22300, Reward: [-497.719 -497.719 -497.719] [88.845], Avg: [-511.171 -511.171 -511.171] (1.0000) ({r_i: None, r_t: [-1009.641 -1009.641 -1009.641], eps: 1.0})
+Step:   22400, Reward: [-620.743 -620.743 -620.743] [55.524], Avg: [-511.658 -511.658 -511.658] (1.0000) ({r_i: None, r_t: [-1050.301 -1050.301 -1050.301], eps: 1.0})
+Step:   22500, Reward: [-449.524 -449.524 -449.524] [63.638], Avg: [-511.383 -511.383 -511.383] (1.0000) ({r_i: None, r_t: [-1066.387 -1066.387 -1066.387], eps: 1.0})
+Step:   22600, Reward: [-445.976 -445.976 -445.976] [64.120], Avg: [-511.095 -511.095 -511.095] (1.0000) ({r_i: None, r_t: [-1036.740 -1036.740 -1036.740], eps: 1.0})
+Step:   22700, Reward: [-463.839 -463.839 -463.839] [66.227], Avg: [-510.887 -510.887 -510.887] (1.0000) ({r_i: None, r_t: [-928.749 -928.749 -928.749], eps: 1.0})
+Step:   22800, Reward: [-544.809 -544.809 -544.809] [147.786], Avg: [-511.035 -511.035 -511.035] (1.0000) ({r_i: None, r_t: [-1102.279 -1102.279 -1102.279], eps: 1.0})
+Step:   22900, Reward: [-533.371 -533.371 -533.371] [66.731], Avg: [-511.133 -511.133 -511.133] (1.0000) ({r_i: None, r_t: [-1008.446 -1008.446 -1008.446], eps: 1.0})
+Step:   23000, Reward: [-592.237 -592.237 -592.237] [36.023], Avg: [-511.484 -511.484 -511.484] (1.0000) ({r_i: None, r_t: [-942.702 -942.702 -942.702], eps: 1.0})
+Step:   23100, Reward: [-449.452 -449.452 -449.452] [78.310], Avg: [-511.216 -511.216 -511.216] (1.0000) ({r_i: None, r_t: [-1008.166 -1008.166 -1008.166], eps: 1.0})
+Step:   23200, Reward: [-437.576 -437.576 -437.576] [60.932], Avg: [-510.900 -510.900 -510.900] (1.0000) ({r_i: None, r_t: [-972.889 -972.889 -972.889], eps: 1.0})
+Step:   23300, Reward: [-554.090 -554.090 -554.090] [145.907], Avg: [-511.085 -511.085 -511.085] (1.0000) ({r_i: None, r_t: [-1165.687 -1165.687 -1165.687], eps: 1.0})
+Step:   23400, Reward: [-493.818 -493.818 -493.818] [97.183], Avg: [-511.011 -511.011 -511.011] (1.0000) ({r_i: None, r_t: [-1079.308 -1079.308 -1079.308], eps: 1.0})
+Step:   23500, Reward: [-591.389 -591.389 -591.389] [74.106], Avg: [-511.352 -511.352 -511.352] (1.0000) ({r_i: None, r_t: [-1052.253 -1052.253 -1052.253], eps: 1.0})
+Step:   23600, Reward: [-539.040 -539.040 -539.040] [30.543], Avg: [-511.469 -511.469 -511.469] (1.0000) ({r_i: None, r_t: [-1080.691 -1080.691 -1080.691], eps: 1.0})
+Step:   23700, Reward: [-438.218 -438.218 -438.218] [19.455], Avg: [-511.161 -511.161 -511.161] (1.0000) ({r_i: None, r_t: [-1007.995 -1007.995 -1007.995], eps: 1.0})
+Step:   23800, Reward: [-503.639 -503.639 -503.639] [72.829], Avg: [-511.129 -511.129 -511.129] (1.0000) ({r_i: None, r_t: [-1108.215 -1108.215 -1108.215], eps: 1.0})
+Step:   23900, Reward: [-442.767 -442.767 -442.767] [64.095], Avg: [-510.845 -510.845 -510.845] (1.0000) ({r_i: None, r_t: [-1062.880 -1062.880 -1062.880], eps: 1.0})
+Step:   24000, Reward: [-475.012 -475.012 -475.012] [46.932], Avg: [-510.696 -510.696 -510.696] (1.0000) ({r_i: None, r_t: [-1040.927 -1040.927 -1040.927], eps: 1.0})
+Step:   24100, Reward: [-580.572 -580.572 -580.572] [163.147], Avg: [-510.985 -510.985 -510.985] (1.0000) ({r_i: None, r_t: [-1154.082 -1154.082 -1154.082], eps: 1.0})
+Step:   24200, Reward: [-603.893 -603.893 -603.893] [176.274], Avg: [-511.367 -511.367 -511.367] (1.0000) ({r_i: None, r_t: [-1168.275 -1168.275 -1168.275], eps: 1.0})
+Step:   24300, Reward: [-541.092 -541.092 -541.092] [32.759], Avg: [-511.489 -511.489 -511.489] (1.0000) ({r_i: None, r_t: [-1056.300 -1056.300 -1056.300], eps: 1.0})
+Step:   24400, Reward: [-453.392 -453.392 -453.392] [40.808], Avg: [-511.252 -511.252 -511.252] (1.0000) ({r_i: None, r_t: [-1101.684 -1101.684 -1101.684], eps: 1.0})
+Step:   24500, Reward: [-420.254 -420.254 -420.254] [64.727], Avg: [-510.882 -510.882 -510.882] (1.0000) ({r_i: None, r_t: [-997.967 -997.967 -997.967], eps: 1.0})
+Step:   24600, Reward: [-539.001 -539.001 -539.001] [82.359], Avg: [-510.996 -510.996 -510.996] (1.0000) ({r_i: None, r_t: [-1044.735 -1044.735 -1044.735], eps: 1.0})
+Step:   24700, Reward: [-387.084 -387.084 -387.084] [46.667], Avg: [-510.496 -510.496 -510.496] (1.0000) ({r_i: None, r_t: [-979.822 -979.822 -979.822], eps: 1.0})
+Step:   24800, Reward: [-533.534 -533.534 -533.534] [158.556], Avg: [-510.589 -510.589 -510.589] (1.0000) ({r_i: None, r_t: [-997.094 -997.094 -997.094], eps: 1.0})
+Step:   24900, Reward: [-513.517 -513.517 -513.517] [93.201], Avg: [-510.600 -510.600 -510.600] (1.0000) ({r_i: None, r_t: [-958.454 -958.454 -958.454], eps: 1.0})
+Step:   25000, Reward: [-462.717 -462.717 -462.717] [67.690], Avg: [-510.409 -510.409 -510.409] (1.0000) ({r_i: None, r_t: [-953.865 -953.865 -953.865], eps: 1.0})
+Step:   25100, Reward: [-598.883 -598.883 -598.883] [39.091], Avg: [-510.761 -510.761 -510.761] (1.0000) ({r_i: None, r_t: [-945.264 -945.264 -945.264], eps: 1.0})
+Step:   25200, Reward: [-418.638 -418.638 -418.638] [23.578], Avg: [-510.396 -510.396 -510.396] (1.0000) ({r_i: None, r_t: [-1034.558 -1034.558 -1034.558], eps: 1.0})
+Step:   25300, Reward: [-542.893 -542.893 -542.893] [118.316], Avg: [-510.524 -510.524 -510.524] (1.0000) ({r_i: None, r_t: [-1018.281 -1018.281 -1018.281], eps: 1.0})
+Step:   25400, Reward: [-455.204 -455.204 -455.204] [36.186], Avg: [-510.307 -510.307 -510.307] (1.0000) ({r_i: None, r_t: [-896.664 -896.664 -896.664], eps: 1.0})
+Step:   25500, Reward: [-490.124 -490.124 -490.124] [76.851], Avg: [-510.229 -510.229 -510.229] (1.0000) ({r_i: None, r_t: [-959.191 -959.191 -959.191], eps: 1.0})
+Step:   25600, Reward: [-659.670 -659.670 -659.670] [84.426], Avg: [-510.810 -510.810 -510.810] (1.0000) ({r_i: None, r_t: [-1103.788 -1103.788 -1103.788], eps: 1.0})
+Step:   25700, Reward: [-586.601 -586.601 -586.601] [74.611], Avg: [-511.104 -511.104 -511.104] (1.0000) ({r_i: None, r_t: [-1051.425 -1051.425 -1051.425], eps: 1.0})
+Step:   25800, Reward: [-596.375 -596.375 -596.375] [74.969], Avg: [-511.433 -511.433 -511.433] (1.0000) ({r_i: None, r_t: [-908.158 -908.158 -908.158], eps: 1.0})
+Step:   25900, Reward: [-507.020 -507.020 -507.020] [95.085], Avg: [-511.416 -511.416 -511.416] (1.0000) ({r_i: None, r_t: [-1021.037 -1021.037 -1021.037], eps: 1.0})
+Step:   26000, Reward: [-504.139 -504.139 -504.139] [95.694], Avg: [-511.388 -511.388 -511.388] (1.0000) ({r_i: None, r_t: [-975.992 -975.992 -975.992], eps: 1.0})
+Step:   26100, Reward: [-556.025 -556.025 -556.025] [46.607], Avg: [-511.559 -511.559 -511.559] (1.0000) ({r_i: None, r_t: [-1130.337 -1130.337 -1130.337], eps: 1.0})
+Step:   26200, Reward: [-430.164 -430.164 -430.164] [37.884], Avg: [-511.249 -511.249 -511.249] (1.0000) ({r_i: None, r_t: [-1071.110 -1071.110 -1071.110], eps: 1.0})
+Step:   26300, Reward: [-466.976 -466.976 -466.976] [77.245], Avg: [-511.081 -511.081 -511.081] (1.0000) ({r_i: None, r_t: [-961.295 -961.295 -961.295], eps: 1.0})
+Step:   26400, Reward: [-572.343 -572.343 -572.343] [123.637], Avg: [-511.313 -511.313 -511.313] (1.0000) ({r_i: None, r_t: [-1031.154 -1031.154 -1031.154], eps: 1.0})
+Step:   26500, Reward: [-601.959 -601.959 -601.959] [195.466], Avg: [-511.653 -511.653 -511.653] (1.0000) ({r_i: None, r_t: [-1063.696 -1063.696 -1063.696], eps: 1.0})
+Step:   26600, Reward: [-472.875 -472.875 -472.875] [75.637], Avg: [-511.508 -511.508 -511.508] (1.0000) ({r_i: None, r_t: [-1066.283 -1066.283 -1066.283], eps: 1.0})
+Step:   26700, Reward: [-461.696 -461.696 -461.696] [57.625], Avg: [-511.322 -511.322 -511.322] (1.0000) ({r_i: None, r_t: [-1102.924 -1102.924 -1102.924], eps: 1.0})
+Step:   26800, Reward: [-619.259 -619.259 -619.259] [55.809], Avg: [-511.724 -511.724 -511.724] (1.0000) ({r_i: None, r_t: [-956.360 -956.360 -956.360], eps: 1.0})
+Step:   26900, Reward: [-637.934 -637.934 -637.934] [290.817], Avg: [-512.191 -512.191 -512.191] (1.0000) ({r_i: None, r_t: [-1193.316 -1193.316 -1193.316], eps: 1.0})
+Step:   27000, Reward: [-502.807 -502.807 -502.807] [62.463], Avg: [-512.156 -512.156 -512.156] (1.0000) ({r_i: None, r_t: [-934.677 -934.677 -934.677], eps: 1.0})
+Step:   27100, Reward: [-549.995 -549.995 -549.995] [83.457], Avg: [-512.295 -512.295 -512.295] (1.0000) ({r_i: None, r_t: [-1012.547 -1012.547 -1012.547], eps: 1.0})
+Step:   27200, Reward: [-503.959 -503.959 -503.959] [96.176], Avg: [-512.265 -512.265 -512.265] (1.0000) ({r_i: None, r_t: [-991.911 -991.911 -991.911], eps: 1.0})
+Step:   27300, Reward: [-496.245 -496.245 -496.245] [64.734], Avg: [-512.206 -512.206 -512.206] (1.0000) ({r_i: None, r_t: [-919.965 -919.965 -919.965], eps: 1.0})
+Step:   27400, Reward: [-579.550 -579.550 -579.550] [94.961], Avg: [-512.451 -512.451 -512.451] (1.0000) ({r_i: None, r_t: [-1015.542 -1015.542 -1015.542], eps: 1.0})
+Step:   27500, Reward: [-546.326 -546.326 -546.326] [74.257], Avg: [-512.574 -512.574 -512.574] (1.0000) ({r_i: None, r_t: [-894.481 -894.481 -894.481], eps: 1.0})
+Step:   27600, Reward: [-501.835 -501.835 -501.835] [48.407], Avg: [-512.535 -512.535 -512.535] (1.0000) ({r_i: None, r_t: [-1105.212 -1105.212 -1105.212], eps: 1.0})
+Step:   27700, Reward: [-403.810 -403.810 -403.810] [59.754], Avg: [-512.144 -512.144 -512.144] (1.0000) ({r_i: None, r_t: [-957.946 -957.946 -957.946], eps: 1.0})
+Step:   27800, Reward: [-452.630 -452.630 -452.630] [24.867], Avg: [-511.931 -511.931 -511.931] (1.0000) ({r_i: None, r_t: [-976.241 -976.241 -976.241], eps: 1.0})
+Step:   27900, Reward: [-530.276 -530.276 -530.276] [104.700], Avg: [-511.996 -511.996 -511.996] (1.0000) ({r_i: None, r_t: [-1077.860 -1077.860 -1077.860], eps: 1.0})
+Step:   28000, Reward: [-638.025 -638.025 -638.025] [178.175], Avg: [-512.445 -512.445 -512.445] (1.0000) ({r_i: None, r_t: [-945.904 -945.904 -945.904], eps: 1.0})
+Step:   28100, Reward: [-617.248 -617.248 -617.248] [56.123], Avg: [-512.817 -512.817 -512.817] (1.0000) ({r_i: None, r_t: [-1052.659 -1052.659 -1052.659], eps: 1.0})
+Step:   28200, Reward: [-515.367 -515.367 -515.367] [62.581], Avg: [-512.826 -512.826 -512.826] (1.0000) ({r_i: None, r_t: [-927.427 -927.427 -927.427], eps: 1.0})
+Step:   28300, Reward: [-454.857 -454.857 -454.857] [42.849], Avg: [-512.621 -512.621 -512.621] (1.0000) ({r_i: None, r_t: [-896.759 -896.759 -896.759], eps: 1.0})
+Step:   28400, Reward: [-464.855 -464.855 -464.855] [66.214], Avg: [-512.454 -512.454 -512.454] (1.0000) ({r_i: None, r_t: [-994.180 -994.180 -994.180], eps: 1.0})
+Step:   28500, Reward: [-557.011 -557.011 -557.011] [52.989], Avg: [-512.610 -512.610 -512.610] (1.0000) ({r_i: None, r_t: [-924.147 -924.147 -924.147], eps: 1.0})
+Step:   28600, Reward: [-510.277 -510.277 -510.277] [114.098], Avg: [-512.602 -512.602 -512.602] (1.0000) ({r_i: None, r_t: [-1035.187 -1035.187 -1035.187], eps: 1.0})
+Step:   28700, Reward: [-496.381 -496.381 -496.381] [106.251], Avg: [-512.545 -512.545 -512.545] (1.0000) ({r_i: None, r_t: [-1050.504 -1050.504 -1050.504], eps: 1.0})
+Step:   28800, Reward: [-574.905 -574.905 -574.905] [111.488], Avg: [-512.761 -512.761 -512.761] (1.0000) ({r_i: None, r_t: [-1265.292 -1265.292 -1265.292], eps: 1.0})
+Step:   28900, Reward: [-481.327 -481.327 -481.327] [66.028], Avg: [-512.653 -512.653 -512.653] (1.0000) ({r_i: None, r_t: [-1020.626 -1020.626 -1020.626], eps: 1.0})
+Step:   29000, Reward: [-471.789 -471.789 -471.789] [104.554], Avg: [-512.512 -512.512 -512.512] (1.0000) ({r_i: None, r_t: [-1119.237 -1119.237 -1119.237], eps: 1.0})
+Step:   29100, Reward: [-539.377 -539.377 -539.377] [47.358], Avg: [-512.604 -512.604 -512.604] (1.0000) ({r_i: None, r_t: [-961.489 -961.489 -961.489], eps: 1.0})
+Step:   29200, Reward: [-415.020 -415.020 -415.020] [68.670], Avg: [-512.271 -512.271 -512.271] (1.0000) ({r_i: None, r_t: [-1040.925 -1040.925 -1040.925], eps: 1.0})
+Step:   29300, Reward: [-527.602 -527.602 -527.602] [197.159], Avg: [-512.323 -512.323 -512.323] (1.0000) ({r_i: None, r_t: [-951.994 -951.994 -951.994], eps: 1.0})
+Step:   29400, Reward: [-520.926 -520.926 -520.926] [96.338], Avg: [-512.352 -512.352 -512.352] (1.0000) ({r_i: None, r_t: [-1060.858 -1060.858 -1060.858], eps: 1.0})
+Step:   29500, Reward: [-583.042 -583.042 -583.042] [126.507], Avg: [-512.591 -512.591 -512.591] (1.0000) ({r_i: None, r_t: [-1114.088 -1114.088 -1114.088], eps: 1.0})
+Step:   29600, Reward: [-523.143 -523.143 -523.143] [95.525], Avg: [-512.627 -512.627 -512.627] (1.0000) ({r_i: None, r_t: [-1029.925 -1029.925 -1029.925], eps: 1.0})
+Step:   29700, Reward: [-528.955 -528.955 -528.955] [150.081], Avg: [-512.682 -512.682 -512.682] (1.0000) ({r_i: None, r_t: [-886.105 -886.105 -886.105], eps: 1.0})
+Step:   29800, Reward: [-486.061 -486.061 -486.061] [92.548], Avg: [-512.593 -512.593 -512.593] (1.0000) ({r_i: None, r_t: [-895.863 -895.863 -895.863], eps: 1.0})
+Step:   29900, Reward: [-506.526 -506.526 -506.526] [64.086], Avg: [-512.572 -512.572 -512.572] (1.0000) ({r_i: None, r_t: [-1037.216 -1037.216 -1037.216], eps: 1.0})
+Step:   30000, Reward: [-535.171 -535.171 -535.171] [175.437], Avg: [-512.647 -512.647 -512.647] (1.0000) ({r_i: None, r_t: [-1021.265 -1021.265 -1021.265], eps: 1.0})
+Step:   30100, Reward: [-452.702 -452.702 -452.702] [45.362], Avg: [-512.449 -512.449 -512.449] (1.0000) ({r_i: None, r_t: [-1000.077 -1000.077 -1000.077], eps: 1.0})
+Step:   30200, Reward: [-529.269 -529.269 -529.269] [132.299], Avg: [-512.504 -512.504 -512.504] (1.0000) ({r_i: None, r_t: [-1029.528 -1029.528 -1029.528], eps: 1.0})
+Step:   30300, Reward: [-522.615 -522.615 -522.615] [58.051], Avg: [-512.538 -512.538 -512.538] (1.0000) ({r_i: None, r_t: [-915.375 -915.375 -915.375], eps: 1.0})
+Step:   30400, Reward: [-507.434 -507.434 -507.434] [97.437], Avg: [-512.521 -512.521 -512.521] (1.0000) ({r_i: None, r_t: [-1057.545 -1057.545 -1057.545], eps: 1.0})
+Step:   30500, Reward: [-598.768 -598.768 -598.768] [178.571], Avg: [-512.803 -512.803 -512.803] (1.0000) ({r_i: None, r_t: [-1025.804 -1025.804 -1025.804], eps: 1.0})
+Step:   30600, Reward: [-543.671 -543.671 -543.671] [95.739], Avg: [-512.903 -512.903 -512.903] (1.0000) ({r_i: None, r_t: [-1084.890 -1084.890 -1084.890], eps: 1.0})
+Step:   30700, Reward: [-552.290 -552.290 -552.290] [73.030], Avg: [-513.031 -513.031 -513.031] (1.0000) ({r_i: None, r_t: [-1029.385 -1029.385 -1029.385], eps: 1.0})
+Step:   30800, Reward: [-535.911 -535.911 -535.911] [89.193], Avg: [-513.105 -513.105 -513.105] (1.0000) ({r_i: None, r_t: [-1171.198 -1171.198 -1171.198], eps: 1.0})
+Step:   30900, Reward: [-530.831 -530.831 -530.831] [117.378], Avg: [-513.162 -513.162 -513.162] (1.0000) ({r_i: None, r_t: [-967.333 -967.333 -967.333], eps: 1.0})
+Step:   31000, Reward: [-504.819 -504.819 -504.819] [41.275], Avg: [-513.136 -513.136 -513.136] (1.0000) ({r_i: None, r_t: [-929.042 -929.042 -929.042], eps: 1.0})
+Step:   31100, Reward: [-464.697 -464.697 -464.697] [60.356], Avg: [-512.980 -512.980 -512.980] (1.0000) ({r_i: None, r_t: [-1025.730 -1025.730 -1025.730], eps: 1.0})
+Step:   31200, Reward: [-533.111 -533.111 -533.111] [117.464], Avg: [-513.045 -513.045 -513.045] (1.0000) ({r_i: None, r_t: [-987.617 -987.617 -987.617], eps: 1.0})
+Step:   31300, Reward: [-478.850 -478.850 -478.850] [102.790], Avg: [-512.936 -512.936 -512.936] (1.0000) ({r_i: None, r_t: [-1031.101 -1031.101 -1031.101], eps: 1.0})
+Step:   31400, Reward: [-576.150 -576.150 -576.150] [196.793], Avg: [-513.136 -513.136 -513.136] (1.0000) ({r_i: None, r_t: [-1067.883 -1067.883 -1067.883], eps: 1.0})
+Step:   31500, Reward: [-582.896 -582.896 -582.896] [146.576], Avg: [-513.357 -513.357 -513.357] (1.0000) ({r_i: None, r_t: [-1173.265 -1173.265 -1173.265], eps: 1.0})
+Step:   31600, Reward: [-506.170 -506.170 -506.170] [86.649], Avg: [-513.335 -513.335 -513.335] (1.0000) ({r_i: None, r_t: [-1039.692 -1039.692 -1039.692], eps: 1.0})
+Step:   31700, Reward: [-606.749 -606.749 -606.749] [57.903], Avg: [-513.628 -513.628 -513.628] (1.0000) ({r_i: None, r_t: [-1062.136 -1062.136 -1062.136], eps: 1.0})
+Step:   31800, Reward: [-536.971 -536.971 -536.971] [103.790], Avg: [-513.701 -513.701 -513.701] (1.0000) ({r_i: None, r_t: [-1000.045 -1000.045 -1000.045], eps: 1.0})
+Step:   31900, Reward: [-456.809 -456.809 -456.809] [71.948], Avg: [-513.524 -513.524 -513.524] (1.0000) ({r_i: None, r_t: [-981.465 -981.465 -981.465], eps: 1.0})
+Step:   32000, Reward: [-628.951 -628.951 -628.951] [116.261], Avg: [-513.883 -513.883 -513.883] (1.0000) ({r_i: None, r_t: [-872.673 -872.673 -872.673], eps: 1.0})
+Step:   32100, Reward: [-629.158 -629.158 -629.158] [142.892], Avg: [-514.241 -514.241 -514.241] (1.0000) ({r_i: None, r_t: [-1074.178 -1074.178 -1074.178], eps: 1.0})
+Step:   32200, Reward: [-406.922 -406.922 -406.922] [50.509], Avg: [-513.909 -513.909 -513.909] (1.0000) ({r_i: None, r_t: [-859.404 -859.404 -859.404], eps: 1.0})
+Step:   32300, Reward: [-554.279 -554.279 -554.279] [138.178], Avg: [-514.034 -514.034 -514.034] (1.0000) ({r_i: None, r_t: [-1023.121 -1023.121 -1023.121], eps: 1.0})
+Step:   32400, Reward: [-501.218 -501.218 -501.218] [68.729], Avg: [-513.994 -513.994 -513.994] (1.0000) ({r_i: None, r_t: [-1003.114 -1003.114 -1003.114], eps: 1.0})
+Step:   32500, Reward: [-471.560 -471.560 -471.560] [62.559], Avg: [-513.864 -513.864 -513.864] (1.0000) ({r_i: None, r_t: [-1042.167 -1042.167 -1042.167], eps: 1.0})
+Step:   32600, Reward: [-578.093 -578.093 -578.093] [97.252], Avg: [-514.060 -514.060 -514.060] (1.0000) ({r_i: None, r_t: [-1073.138 -1073.138 -1073.138], eps: 1.0})
+Step:   32700, Reward: [-513.602 -513.602 -513.602] [94.887], Avg: [-514.059 -514.059 -514.059] (1.0000) ({r_i: None, r_t: [-937.584 -937.584 -937.584], eps: 1.0})
+Step:   32800, Reward: [-542.068 -542.068 -542.068] [113.391], Avg: [-514.144 -514.144 -514.144] (1.0000) ({r_i: None, r_t: [-1002.489 -1002.489 -1002.489], eps: 1.0})
+Step:   32900, Reward: [-536.793 -536.793 -536.793] [132.056], Avg: [-514.213 -514.213 -514.213] (1.0000) ({r_i: None, r_t: [-1125.486 -1125.486 -1125.486], eps: 1.0})
+Step:   33000, Reward: [-509.663 -509.663 -509.663] [49.508], Avg: [-514.199 -514.199 -514.199] (1.0000) ({r_i: None, r_t: [-935.895 -935.895 -935.895], eps: 1.0})
+Step:   33100, Reward: [-568.501 -568.501 -568.501] [75.608], Avg: [-514.363 -514.363 -514.363] (1.0000) ({r_i: None, r_t: [-1062.571 -1062.571 -1062.571], eps: 1.0})
+Step:   33200, Reward: [-551.317 -551.317 -551.317] [57.172], Avg: [-514.474 -514.474 -514.474] (1.0000) ({r_i: None, r_t: [-993.049 -993.049 -993.049], eps: 1.0})
+Step:   33300, Reward: [-504.086 -504.086 -504.086] [65.232], Avg: [-514.442 -514.442 -514.442] (1.0000) ({r_i: None, r_t: [-965.730 -965.730 -965.730], eps: 1.0})
+Step:   33400, Reward: [-498.135 -498.135 -498.135] [88.558], Avg: [-514.394 -514.394 -514.394] (1.0000) ({r_i: None, r_t: [-900.498 -900.498 -900.498], eps: 1.0})
+Step:   33500, Reward: [-498.463 -498.463 -498.463] [52.563], Avg: [-514.346 -514.346 -514.346] (1.0000) ({r_i: None, r_t: [-977.533 -977.533 -977.533], eps: 1.0})
+Step:   33600, Reward: [-607.327 -607.327 -607.327] [185.527], Avg: [-514.622 -514.622 -514.622] (1.0000) ({r_i: None, r_t: [-1109.054 -1109.054 -1109.054], eps: 1.0})
+Step:   33700, Reward: [-567.693 -567.693 -567.693] [69.437], Avg: [-514.779 -514.779 -514.779] (1.0000) ({r_i: None, r_t: [-956.964 -956.964 -956.964], eps: 1.0})
+Step:   33800, Reward: [-576.931 -576.931 -576.931] [116.399], Avg: [-514.963 -514.963 -514.963] (1.0000) ({r_i: None, r_t: [-1037.882 -1037.882 -1037.882], eps: 1.0})
+Step:   33900, Reward: [-523.183 -523.183 -523.183] [61.990], Avg: [-514.987 -514.987 -514.987] (1.0000) ({r_i: None, r_t: [-919.381 -919.381 -919.381], eps: 1.0})
+Step:   34000, Reward: [-561.981 -561.981 -561.981] [165.107], Avg: [-515.125 -515.125 -515.125] (1.0000) ({r_i: None, r_t: [-1023.274 -1023.274 -1023.274], eps: 1.0})
+Step:   34100, Reward: [-624.343 -624.343 -624.343] [105.325], Avg: [-515.444 -515.444 -515.444] (1.0000) ({r_i: None, r_t: [-1132.437 -1132.437 -1132.437], eps: 1.0})
+Step:   34200, Reward: [-613.010 -613.010 -613.010] [214.306], Avg: [-515.728 -515.728 -515.728] (1.0000) ({r_i: None, r_t: [-978.554 -978.554 -978.554], eps: 1.0})
+Step:   34300, Reward: [-606.819 -606.819 -606.819] [96.907], Avg: [-515.993 -515.993 -515.993] (1.0000) ({r_i: None, r_t: [-1163.670 -1163.670 -1163.670], eps: 1.0})
+Step:   34400, Reward: [-645.401 -645.401 -645.401] [75.313], Avg: [-516.368 -516.368 -516.368] (1.0000) ({r_i: None, r_t: [-1123.021 -1123.021 -1123.021], eps: 1.0})
+Step:   34500, Reward: [-474.790 -474.790 -474.790] [95.299], Avg: [-516.248 -516.248 -516.248] (1.0000) ({r_i: None, r_t: [-1029.820 -1029.820 -1029.820], eps: 1.0})
+Step:   34600, Reward: [-507.225 -507.225 -507.225] [30.521], Avg: [-516.222 -516.222 -516.222] (1.0000) ({r_i: None, r_t: [-1069.661 -1069.661 -1069.661], eps: 1.0})
+Step:   34700, Reward: [-639.185 -639.185 -639.185] [98.303], Avg: [-516.575 -516.575 -516.575] (1.0000) ({r_i: None, r_t: [-1001.248 -1001.248 -1001.248], eps: 1.0})
+Step:   34800, Reward: [-422.653 -422.653 -422.653] [44.503], Avg: [-516.306 -516.306 -516.306] (1.0000) ({r_i: None, r_t: [-1068.754 -1068.754 -1068.754], eps: 1.0})
+Step:   34900, Reward: [-626.825 -626.825 -626.825] [210.395], Avg: [-516.622 -516.622 -516.622] (1.0000) ({r_i: None, r_t: [-962.851 -962.851 -962.851], eps: 1.0})
+Step:   35000, Reward: [-589.031 -589.031 -589.031] [147.873], Avg: [-516.828 -516.828 -516.828] (1.0000) ({r_i: None, r_t: [-1071.518 -1071.518 -1071.518], eps: 1.0})
+Step:   35100, Reward: [-555.164 -555.164 -555.164] [106.967], Avg: [-516.937 -516.937 -516.937] (1.0000) ({r_i: None, r_t: [-1005.499 -1005.499 -1005.499], eps: 1.0})
+Step:   35200, Reward: [-622.697 -622.697 -622.697] [82.503], Avg: [-517.237 -517.237 -517.237] (1.0000) ({r_i: None, r_t: [-1028.572 -1028.572 -1028.572], eps: 1.0})
+Step:   35300, Reward: [-486.999 -486.999 -486.999] [115.072], Avg: [-517.152 -517.152 -517.152] (1.0000) ({r_i: None, r_t: [-1111.261 -1111.261 -1111.261], eps: 1.0})
+Step:   35400, Reward: [-402.425 -402.425 -402.425] [64.666], Avg: [-516.828 -516.828 -516.828] (1.0000) ({r_i: None, r_t: [-1024.886 -1024.886 -1024.886], eps: 1.0})
+Step:   35500, Reward: [-446.581 -446.581 -446.581] [62.959], Avg: [-516.631 -516.631 -516.631] (1.0000) ({r_i: None, r_t: [-1033.750 -1033.750 -1033.750], eps: 1.0})
+Step:   35600, Reward: [-553.583 -553.583 -553.583] [225.631], Avg: [-516.735 -516.735 -516.735] (1.0000) ({r_i: None, r_t: [-878.503 -878.503 -878.503], eps: 1.0})
+Step:   35700, Reward: [-460.582 -460.582 -460.582] [96.518], Avg: [-516.578 -516.578 -516.578] (1.0000) ({r_i: None, r_t: [-1145.800 -1145.800 -1145.800], eps: 1.0})
+Step:   35800, Reward: [-576.547 -576.547 -576.547] [154.776], Avg: [-516.745 -516.745 -516.745] (1.0000) ({r_i: None, r_t: [-1099.977 -1099.977 -1099.977], eps: 1.0})
+Step:   35900, Reward: [-570.133 -570.133 -570.133] [46.296], Avg: [-516.893 -516.893 -516.893] (1.0000) ({r_i: None, r_t: [-1167.899 -1167.899 -1167.899], eps: 1.0})
+Step:   36000, Reward: [-558.950 -558.950 -558.950] [129.116], Avg: [-517.010 -517.010 -517.010] (1.0000) ({r_i: None, r_t: [-1039.796 -1039.796 -1039.796], eps: 1.0})
+Step:   36100, Reward: [-522.515 -522.515 -522.515] [60.822], Avg: [-517.025 -517.025 -517.025] (1.0000) ({r_i: None, r_t: [-998.396 -998.396 -998.396], eps: 1.0})
+Step:   36200, Reward: [-491.478 -491.478 -491.478] [43.290], Avg: [-516.954 -516.954 -516.954] (1.0000) ({r_i: None, r_t: [-1103.673 -1103.673 -1103.673], eps: 1.0})
+Step:   36300, Reward: [-482.928 -482.928 -482.928] [47.500], Avg: [-516.861 -516.861 -516.861] (1.0000) ({r_i: None, r_t: [-1049.953 -1049.953 -1049.953], eps: 1.0})
+Step:   36400, Reward: [-474.832 -474.832 -474.832] [100.833], Avg: [-516.746 -516.746 -516.746] (1.0000) ({r_i: None, r_t: [-948.588 -948.588 -948.588], eps: 1.0})
+Step:   36500, Reward: [-502.082 -502.082 -502.082] [77.371], Avg: [-516.706 -516.706 -516.706] (1.0000) ({r_i: None, r_t: [-1073.047 -1073.047 -1073.047], eps: 1.0})
+Step:   36600, Reward: [-540.171 -540.171 -540.171] [120.648], Avg: [-516.770 -516.770 -516.770] (1.0000) ({r_i: None, r_t: [-1073.947 -1073.947 -1073.947], eps: 1.0})
+Step:   36700, Reward: [-479.016 -479.016 -479.016] [83.516], Avg: [-516.667 -516.667 -516.667] (1.0000) ({r_i: None, r_t: [-1092.258 -1092.258 -1092.258], eps: 1.0})
+Step:   36800, Reward: [-437.320 -437.320 -437.320] [48.437], Avg: [-516.452 -516.452 -516.452] (1.0000) ({r_i: None, r_t: [-856.037 -856.037 -856.037], eps: 1.0})
+Step:   36900, Reward: [-518.611 -518.611 -518.611] [192.470], Avg: [-516.458 -516.458 -516.458] (1.0000) ({r_i: None, r_t: [-1221.566 -1221.566 -1221.566], eps: 1.0})
+Step:   37000, Reward: [-478.988 -478.988 -478.988] [78.356], Avg: [-516.357 -516.357 -516.357] (1.0000) ({r_i: None, r_t: [-1068.837 -1068.837 -1068.837], eps: 1.0})
+Step:   37100, Reward: [-568.267 -568.267 -568.267] [55.572], Avg: [-516.496 -516.496 -516.496] (1.0000) ({r_i: None, r_t: [-1040.682 -1040.682 -1040.682], eps: 1.0})
+Step:   37200, Reward: [-521.627 -521.627 -521.627] [125.134], Avg: [-516.510 -516.510 -516.510] (1.0000) ({r_i: None, r_t: [-969.318 -969.318 -969.318], eps: 1.0})
+Step:   37300, Reward: [-657.551 -657.551 -657.551] [193.405], Avg: [-516.887 -516.887 -516.887] (1.0000) ({r_i: None, r_t: [-1040.557 -1040.557 -1040.557], eps: 1.0})
+Step:   37400, Reward: [-492.157 -492.157 -492.157] [33.428], Avg: [-516.821 -516.821 -516.821] (1.0000) ({r_i: None, r_t: [-1013.579 -1013.579 -1013.579], eps: 1.0})
+Step:   37500, Reward: [-477.757 -477.757 -477.757] [58.520], Avg: [-516.717 -516.717 -516.717] (1.0000) ({r_i: None, r_t: [-1030.377 -1030.377 -1030.377], eps: 1.0})
+Step:   37600, Reward: [-536.131 -536.131 -536.131] [63.010], Avg: [-516.769 -516.769 -516.769] (1.0000) ({r_i: None, r_t: [-1051.209 -1051.209 -1051.209], eps: 1.0})
+Step:   37700, Reward: [-490.400 -490.400 -490.400] [155.351], Avg: [-516.699 -516.699 -516.699] (1.0000) ({r_i: None, r_t: [-973.149 -973.149 -973.149], eps: 1.0})
+Step:   37800, Reward: [-471.595 -471.595 -471.595] [45.041], Avg: [-516.580 -516.580 -516.580] (1.0000) ({r_i: None, r_t: [-1127.036 -1127.036 -1127.036], eps: 1.0})
+Step:   37900, Reward: [-479.790 -479.790 -479.790] [69.659], Avg: [-516.483 -516.483 -516.483] (1.0000) ({r_i: None, r_t: [-1046.722 -1046.722 -1046.722], eps: 1.0})
+Step:   38000, Reward: [-512.570 -512.570 -512.570] [49.481], Avg: [-516.473 -516.473 -516.473] (1.0000) ({r_i: None, r_t: [-947.151 -947.151 -947.151], eps: 1.0})
+Step:   38100, Reward: [-531.793 -531.793 -531.793] [100.853], Avg: [-516.513 -516.513 -516.513] (1.0000) ({r_i: None, r_t: [-1060.268 -1060.268 -1060.268], eps: 1.0})
+Step:   38200, Reward: [-566.083 -566.083 -566.083] [147.531], Avg: [-516.643 -516.643 -516.643] (1.0000) ({r_i: None, r_t: [-1052.612 -1052.612 -1052.612], eps: 1.0})
+Step:   38300, Reward: [-573.123 -573.123 -573.123] [200.509], Avg: [-516.790 -516.790 -516.790] (1.0000) ({r_i: None, r_t: [-1019.135 -1019.135 -1019.135], eps: 1.0})
+Step:   38400, Reward: [-596.092 -596.092 -596.092] [126.329], Avg: [-516.996 -516.996 -516.996] (1.0000) ({r_i: None, r_t: [-1045.904 -1045.904 -1045.904], eps: 1.0})
+Step:   38500, Reward: [-587.019 -587.019 -587.019] [66.239], Avg: [-517.177 -517.177 -517.177] (1.0000) ({r_i: None, r_t: [-1272.154 -1272.154 -1272.154], eps: 1.0})
+Step:   38600, Reward: [-549.450 -549.450 -549.450] [146.398], Avg: [-517.260 -517.260 -517.260] (1.0000) ({r_i: None, r_t: [-968.877 -968.877 -968.877], eps: 1.0})
+Step:   38700, Reward: [-609.452 -609.452 -609.452] [114.818], Avg: [-517.498 -517.498 -517.498] (1.0000) ({r_i: None, r_t: [-1156.768 -1156.768 -1156.768], eps: 1.0})
+Step:   38800, Reward: [-567.579 -567.579 -567.579] [130.136], Avg: [-517.627 -517.627 -517.627] (1.0000) ({r_i: None, r_t: [-951.673 -951.673 -951.673], eps: 1.0})
+Step:   38900, Reward: [-529.415 -529.415 -529.415] [53.258], Avg: [-517.657 -517.657 -517.657] (1.0000) ({r_i: None, r_t: [-1054.769 -1054.769 -1054.769], eps: 1.0})
+Step:   39000, Reward: [-455.311 -455.311 -455.311] [78.830], Avg: [-517.498 -517.498 -517.498] (1.0000) ({r_i: None, r_t: [-1052.394 -1052.394 -1052.394], eps: 1.0})
+Step:   39100, Reward: [-498.713 -498.713 -498.713] [70.904], Avg: [-517.450 -517.450 -517.450] (1.0000) ({r_i: None, r_t: [-1074.793 -1074.793 -1074.793], eps: 1.0})
+Step:   39200, Reward: [-456.501 -456.501 -456.501] [32.492], Avg: [-517.295 -517.295 -517.295] (1.0000) ({r_i: None, r_t: [-1173.867 -1173.867 -1173.867], eps: 1.0})
+Step:   39300, Reward: [-499.305 -499.305 -499.305] [68.379], Avg: [-517.249 -517.249 -517.249] (1.0000) ({r_i: None, r_t: [-930.897 -930.897 -930.897], eps: 1.0})
+Step:   39400, Reward: [-467.334 -467.334 -467.334] [138.848], Avg: [-517.122 -517.122 -517.122] (1.0000) ({r_i: None, r_t: [-961.270 -961.270 -961.270], eps: 1.0})
+Step:   39500, Reward: [-580.155 -580.155 -580.155] [100.764], Avg: [-517.282 -517.282 -517.282] (1.0000) ({r_i: None, r_t: [-1015.684 -1015.684 -1015.684], eps: 1.0})
+Step:   39600, Reward: [-450.269 -450.269 -450.269] [48.230], Avg: [-517.113 -517.113 -517.113] (1.0000) ({r_i: None, r_t: [-925.522 -925.522 -925.522], eps: 1.0})
+Step:   39700, Reward: [-444.633 -444.633 -444.633] [64.624], Avg: [-516.931 -516.931 -516.931] (1.0000) ({r_i: None, r_t: [-1204.284 -1204.284 -1204.284], eps: 1.0})
+Step:   39800, Reward: [-521.286 -521.286 -521.286] [95.494], Avg: [-516.942 -516.942 -516.942] (1.0000) ({r_i: None, r_t: [-967.961 -967.961 -967.961], eps: 1.0})
+Step:   39900, Reward: [-598.336 -598.336 -598.336] [26.104], Avg: [-517.145 -517.145 -517.145] (1.0000) ({r_i: None, r_t: [-1005.974 -1005.974 -1005.974], eps: 1.0})
+Step:   40000, Reward: [-472.604 -472.604 -472.604] [75.940], Avg: [-517.034 -517.034 -517.034] (1.0000) ({r_i: None, r_t: [-1013.279 -1013.279 -1013.279], eps: 1.0})
+Step:   40100, Reward: [-413.244 -413.244 -413.244] [45.338], Avg: [-516.776 -516.776 -516.776] (1.0000) ({r_i: None, r_t: [-1064.585 -1064.585 -1064.585], eps: 1.0})
+Step:   40200, Reward: [-524.130 -524.130 -524.130] [71.037], Avg: [-516.794 -516.794 -516.794] (1.0000) ({r_i: None, r_t: [-1024.448 -1024.448 -1024.448], eps: 1.0})
+Step:   40300, Reward: [-504.694 -504.694 -504.694] [73.307], Avg: [-516.764 -516.764 -516.764] (1.0000) ({r_i: None, r_t: [-965.712 -965.712 -965.712], eps: 1.0})
+Step:   40400, Reward: [-513.835 -513.835 -513.835] [72.271], Avg: [-516.757 -516.757 -516.757] (1.0000) ({r_i: None, r_t: [-903.905 -903.905 -903.905], eps: 1.0})
+Step:   40500, Reward: [-541.652 -541.652 -541.652] [95.045], Avg: [-516.818 -516.818 -516.818] (1.0000) ({r_i: None, r_t: [-941.526 -941.526 -941.526], eps: 1.0})
+Step:   40600, Reward: [-688.349 -688.349 -688.349] [178.055], Avg: [-517.240 -517.240 -517.240] (1.0000) ({r_i: None, r_t: [-1062.347 -1062.347 -1062.347], eps: 1.0})
+Step:   40700, Reward: [-590.431 -590.431 -590.431] [216.898], Avg: [-517.419 -517.419 -517.419] (1.0000) ({r_i: None, r_t: [-927.513 -927.513 -927.513], eps: 1.0})
+Step:   40800, Reward: [-534.736 -534.736 -534.736] [96.867], Avg: [-517.461 -517.461 -517.461] (1.0000) ({r_i: None, r_t: [-976.474 -976.474 -976.474], eps: 1.0})
+Step:   40900, Reward: [-437.048 -437.048 -437.048] [64.190], Avg: [-517.265 -517.265 -517.265] (1.0000) ({r_i: None, r_t: [-993.531 -993.531 -993.531], eps: 1.0})
+Step:   41000, Reward: [-468.175 -468.175 -468.175] [72.845], Avg: [-517.146 -517.146 -517.146] (1.0000) ({r_i: None, r_t: [-1032.335 -1032.335 -1032.335], eps: 1.0})
+Step:   41100, Reward: [-514.602 -514.602 -514.602] [61.629], Avg: [-517.140 -517.140 -517.140] (1.0000) ({r_i: None, r_t: [-931.696 -931.696 -931.696], eps: 1.0})
+Step:   41200, Reward: [-620.643 -620.643 -620.643] [72.827], Avg: [-517.390 -517.390 -517.390] (1.0000) ({r_i: None, r_t: [-990.537 -990.537 -990.537], eps: 1.0})
+Step:   41300, Reward: [-506.706 -506.706 -506.706] [87.494], Avg: [-517.365 -517.365 -517.365] (1.0000) ({r_i: None, r_t: [-1014.892 -1014.892 -1014.892], eps: 1.0})
+Step:   41400, Reward: [-474.549 -474.549 -474.549] [127.608], Avg: [-517.261 -517.261 -517.261] (1.0000) ({r_i: None, r_t: [-1138.380 -1138.380 -1138.380], eps: 1.0})
+Step:   41500, Reward: [-503.844 -503.844 -503.844] [58.159], Avg: [-517.229 -517.229 -517.229] (1.0000) ({r_i: None, r_t: [-1052.771 -1052.771 -1052.771], eps: 1.0})
+Step:   41600, Reward: [-471.142 -471.142 -471.142] [56.792], Avg: [-517.119 -517.119 -517.119] (1.0000) ({r_i: None, r_t: [-1087.374 -1087.374 -1087.374], eps: 1.0})
+Step:   41700, Reward: [-417.732 -417.732 -417.732] [97.230], Avg: [-516.881 -516.881 -516.881] (1.0000) ({r_i: None, r_t: [-1014.006 -1014.006 -1014.006], eps: 1.0})
+Step:   41800, Reward: [-527.461 -527.461 -527.461] [142.765], Avg: [-516.906 -516.906 -516.906] (1.0000) ({r_i: None, r_t: [-1012.078 -1012.078 -1012.078], eps: 1.0})
+Step:   41900, Reward: [-517.758 -517.758 -517.758] [96.864], Avg: [-516.908 -516.908 -516.908] (1.0000) ({r_i: None, r_t: [-926.876 -926.876 -926.876], eps: 1.0})
+Step:   42000, Reward: [-600.766 -600.766 -600.766] [68.160], Avg: [-517.107 -517.107 -517.107] (1.0000) ({r_i: None, r_t: [-1031.497 -1031.497 -1031.497], eps: 1.0})
+Step:   42100, Reward: [-476.886 -476.886 -476.886] [26.176], Avg: [-517.012 -517.012 -517.012] (1.0000) ({r_i: None, r_t: [-1105.484 -1105.484 -1105.484], eps: 1.0})
+Step:   42200, Reward: [-596.831 -596.831 -596.831] [81.172], Avg: [-517.201 -517.201 -517.201] (1.0000) ({r_i: None, r_t: [-1074.074 -1074.074 -1074.074], eps: 1.0})
+Step:   42300, Reward: [-646.974 -646.974 -646.974] [89.079], Avg: [-517.507 -517.507 -517.507] (1.0000) ({r_i: None, r_t: [-1118.623 -1118.623 -1118.623], eps: 1.0})
+Step:   42400, Reward: [-529.333 -529.333 -529.333] [67.291], Avg: [-517.535 -517.535 -517.535] (1.0000) ({r_i: None, r_t: [-926.641 -926.641 -926.641], eps: 1.0})
+Step:   42500, Reward: [-457.972 -457.972 -457.972] [55.185], Avg: [-517.395 -517.395 -517.395] (1.0000) ({r_i: None, r_t: [-975.511 -975.511 -975.511], eps: 1.0})
+Step:   42600, Reward: [-404.038 -404.038 -404.038] [44.324], Avg: [-517.129 -517.129 -517.129] (1.0000) ({r_i: None, r_t: [-897.312 -897.312 -897.312], eps: 1.0})
+Step:   42700, Reward: [-553.253 -553.253 -553.253] [40.573], Avg: [-517.214 -517.214 -517.214] (1.0000) ({r_i: None, r_t: [-1134.218 -1134.218 -1134.218], eps: 1.0})
+Step:   42800, Reward: [-543.118 -543.118 -543.118] [118.218], Avg: [-517.274 -517.274 -517.274] (1.0000) ({r_i: None, r_t: [-993.418 -993.418 -993.418], eps: 1.0})
+Step:   42900, Reward: [-508.944 -508.944 -508.944] [39.501], Avg: [-517.255 -517.255 -517.255] (1.0000) ({r_i: None, r_t: [-1070.615 -1070.615 -1070.615], eps: 1.0})
+Step:   43000, Reward: [-470.356 -470.356 -470.356] [109.524], Avg: [-517.146 -517.146 -517.146] (1.0000) ({r_i: None, r_t: [-1047.776 -1047.776 -1047.776], eps: 1.0})
+Step:   43100, Reward: [-402.408 -402.408 -402.408] [43.150], Avg: [-516.880 -516.880 -516.880] (1.0000) ({r_i: None, r_t: [-1033.050 -1033.050 -1033.050], eps: 1.0})
+Step:   43200, Reward: [-503.555 -503.555 -503.555] [44.351], Avg: [-516.849 -516.849 -516.849] (1.0000) ({r_i: None, r_t: [-965.641 -965.641 -965.641], eps: 1.0})
+Step:   43300, Reward: [-581.838 -581.838 -581.838] [138.211], Avg: [-516.999 -516.999 -516.999] (1.0000) ({r_i: None, r_t: [-952.591 -952.591 -952.591], eps: 1.0})
+Step:   43400, Reward: [-582.626 -582.626 -582.626] [97.372], Avg: [-517.150 -517.150 -517.150] (1.0000) ({r_i: None, r_t: [-1044.907 -1044.907 -1044.907], eps: 1.0})
+Step:   43500, Reward: [-491.912 -491.912 -491.912] [100.121], Avg: [-517.092 -517.092 -517.092] (1.0000) ({r_i: None, r_t: [-1033.292 -1033.292 -1033.292], eps: 1.0})
+Step:   43600, Reward: [-618.234 -618.234 -618.234] [93.858], Avg: [-517.324 -517.324 -517.324] (1.0000) ({r_i: None, r_t: [-887.756 -887.756 -887.756], eps: 1.0})
+Step:   43700, Reward: [-481.703 -481.703 -481.703] [91.132], Avg: [-517.242 -517.242 -517.242] (1.0000) ({r_i: None, r_t: [-1071.264 -1071.264 -1071.264], eps: 1.0})
+Step:   43800, Reward: [-505.031 -505.031 -505.031] [120.933], Avg: [-517.215 -517.215 -517.215] (1.0000) ({r_i: None, r_t: [-1095.528 -1095.528 -1095.528], eps: 1.0})
+Step:   43900, Reward: [-575.234 -575.234 -575.234] [146.474], Avg: [-517.346 -517.346 -517.346] (1.0000) ({r_i: None, r_t: [-1001.033 -1001.033 -1001.033], eps: 1.0})
+Step:   44000, Reward: [-453.347 -453.347 -453.347] [48.288], Avg: [-517.201 -517.201 -517.201] (1.0000) ({r_i: None, r_t: [-1057.244 -1057.244 -1057.244], eps: 1.0})
+Step:   44100, Reward: [-601.458 -601.458 -601.458] [98.275], Avg: [-517.392 -517.392 -517.392] (1.0000) ({r_i: None, r_t: [-1128.825 -1128.825 -1128.825], eps: 1.0})
+Step:   44200, Reward: [-426.355 -426.355 -426.355] [77.051], Avg: [-517.186 -517.186 -517.186] (1.0000) ({r_i: None, r_t: [-921.251 -921.251 -921.251], eps: 1.0})
+Step:   44300, Reward: [-511.686 -511.686 -511.686] [48.208], Avg: [-517.174 -517.174 -517.174] (1.0000) ({r_i: None, r_t: [-1084.438 -1084.438 -1084.438], eps: 1.0})
+Step:   44400, Reward: [-420.080 -420.080 -420.080] [9.275], Avg: [-516.956 -516.956 -516.956] (1.0000) ({r_i: None, r_t: [-1209.333 -1209.333 -1209.333], eps: 1.0})
+Step:   44500, Reward: [-501.423 -501.423 -501.423] [69.379], Avg: [-516.921 -516.921 -516.921] (1.0000) ({r_i: None, r_t: [-1096.126 -1096.126 -1096.126], eps: 1.0})
+Step:   44600, Reward: [-554.805 -554.805 -554.805] [66.835], Avg: [-517.006 -517.006 -517.006] (1.0000) ({r_i: None, r_t: [-915.182 -915.182 -915.182], eps: 1.0})
+Step:   44700, Reward: [-566.374 -566.374 -566.374] [130.920], Avg: [-517.116 -517.116 -517.116] (1.0000) ({r_i: None, r_t: [-1138.952 -1138.952 -1138.952], eps: 1.0})
+Step:   44800, Reward: [-429.057 -429.057 -429.057] [64.794], Avg: [-516.920 -516.920 -516.920] (1.0000) ({r_i: None, r_t: [-959.426 -959.426 -959.426], eps: 1.0})
+Step:   44900, Reward: [-529.718 -529.718 -529.718] [85.184], Avg: [-516.948 -516.948 -516.948] (1.0000) ({r_i: None, r_t: [-1105.405 -1105.405 -1105.405], eps: 1.0})
+Step:   45000, Reward: [-614.347 -614.347 -614.347] [69.976], Avg: [-517.164 -517.164 -517.164] (1.0000) ({r_i: None, r_t: [-1035.506 -1035.506 -1035.506], eps: 1.0})
+Step:   45100, Reward: [-473.229 -473.229 -473.229] [29.296], Avg: [-517.067 -517.067 -517.067] (1.0000) ({r_i: None, r_t: [-1067.889 -1067.889 -1067.889], eps: 1.0})
+Step:   45200, Reward: [-580.458 -580.458 -580.458] [98.131], Avg: [-517.207 -517.207 -517.207] (1.0000) ({r_i: None, r_t: [-948.326 -948.326 -948.326], eps: 1.0})
+Step:   45300, Reward: [-443.923 -443.923 -443.923] [20.544], Avg: [-517.046 -517.046 -517.046] (1.0000) ({r_i: None, r_t: [-965.116 -965.116 -965.116], eps: 1.0})
+Step:   45400, Reward: [-533.443 -533.443 -533.443] [62.417], Avg: [-517.082 -517.082 -517.082] (1.0000) ({r_i: None, r_t: [-958.709 -958.709 -958.709], eps: 1.0})
+Step:   45500, Reward: [-549.745 -549.745 -549.745] [188.947], Avg: [-517.153 -517.153 -517.153] (1.0000) ({r_i: None, r_t: [-1130.837 -1130.837 -1130.837], eps: 1.0})
+Step:   45600, Reward: [-438.512 -438.512 -438.512] [88.112], Avg: [-516.981 -516.981 -516.981] (1.0000) ({r_i: None, r_t: [-1131.717 -1131.717 -1131.717], eps: 1.0})
+Step:   45700, Reward: [-510.245 -510.245 -510.245] [67.477], Avg: [-516.966 -516.966 -516.966] (1.0000) ({r_i: None, r_t: [-1083.778 -1083.778 -1083.778], eps: 1.0})
+Step:   45800, Reward: [-470.082 -470.082 -470.082] [97.768], Avg: [-516.864 -516.864 -516.864] (1.0000) ({r_i: None, r_t: [-1062.746 -1062.746 -1062.746], eps: 1.0})
+Step:   45900, Reward: [-585.243 -585.243 -585.243] [148.302], Avg: [-517.013 -517.013 -517.013] (1.0000) ({r_i: None, r_t: [-976.608 -976.608 -976.608], eps: 1.0})
+Step:   46000, Reward: [-544.562 -544.562 -544.562] [73.556], Avg: [-517.073 -517.073 -517.073] (1.0000) ({r_i: None, r_t: [-1008.246 -1008.246 -1008.246], eps: 1.0})
+Step:   46100, Reward: [-487.252 -487.252 -487.252] [87.950], Avg: [-517.008 -517.008 -517.008] (1.0000) ({r_i: None, r_t: [-1095.681 -1095.681 -1095.681], eps: 1.0})
+Step:   46200, Reward: [-538.197 -538.197 -538.197] [69.906], Avg: [-517.054 -517.054 -517.054] (1.0000) ({r_i: None, r_t: [-1019.590 -1019.590 -1019.590], eps: 1.0})
+Step:   46300, Reward: [-414.024 -414.024 -414.024] [40.016], Avg: [-516.832 -516.832 -516.832] (1.0000) ({r_i: None, r_t: [-1118.250 -1118.250 -1118.250], eps: 1.0})
+Step:   46400, Reward: [-511.175 -511.175 -511.175] [134.743], Avg: [-516.820 -516.820 -516.820] (1.0000) ({r_i: None, r_t: [-923.973 -923.973 -923.973], eps: 1.0})
+Step:   46500, Reward: [-472.924 -472.924 -472.924] [98.609], Avg: [-516.725 -516.725 -516.725] (1.0000) ({r_i: None, r_t: [-972.607 -972.607 -972.607], eps: 1.0})
+Step:   46600, Reward: [-474.870 -474.870 -474.870] [31.696], Avg: [-516.636 -516.636 -516.636] (1.0000) ({r_i: None, r_t: [-1114.099 -1114.099 -1114.099], eps: 1.0})
+Step:   46700, Reward: [-497.784 -497.784 -497.784] [130.049], Avg: [-516.596 -516.596 -516.596] (1.0000) ({r_i: None, r_t: [-1024.018 -1024.018 -1024.018], eps: 1.0})
+Step:   46800, Reward: [-541.371 -541.371 -541.371] [86.808], Avg: [-516.648 -516.648 -516.648] (1.0000) ({r_i: None, r_t: [-1049.254 -1049.254 -1049.254], eps: 1.0})
+Step:   46900, Reward: [-451.722 -451.722 -451.722] [56.905], Avg: [-516.510 -516.510 -516.510] (1.0000) ({r_i: None, r_t: [-1111.691 -1111.691 -1111.691], eps: 1.0})
+Step:   47000, Reward: [-482.993 -482.993 -482.993] [73.558], Avg: [-516.439 -516.439 -516.439] (1.0000) ({r_i: None, r_t: [-993.285 -993.285 -993.285], eps: 1.0})
+Step:   47100, Reward: [-454.531 -454.531 -454.531] [49.463], Avg: [-516.308 -516.308 -516.308] (1.0000) ({r_i: None, r_t: [-1188.587 -1188.587 -1188.587], eps: 1.0})
+Step:   47200, Reward: [-451.197 -451.197 -451.197] [32.459], Avg: [-516.170 -516.170 -516.170] (1.0000) ({r_i: None, r_t: [-989.294 -989.294 -989.294], eps: 1.0})
+Step:   47300, Reward: [-469.692 -469.692 -469.692] [82.630], Avg: [-516.072 -516.072 -516.072] (1.0000) ({r_i: None, r_t: [-1117.399 -1117.399 -1117.399], eps: 1.0})
+Step:   47400, Reward: [-507.494 -507.494 -507.494] [46.081], Avg: [-516.054 -516.054 -516.054] (1.0000) ({r_i: None, r_t: [-1001.963 -1001.963 -1001.963], eps: 1.0})
+Step:   47500, Reward: [-443.702 -443.702 -443.702] [74.881], Avg: [-515.902 -515.902 -515.902] (1.0000) ({r_i: None, r_t: [-1079.670 -1079.670 -1079.670], eps: 1.0})
+Step:   47600, Reward: [-585.458 -585.458 -585.458] [155.534], Avg: [-516.048 -516.048 -516.048] (1.0000) ({r_i: None, r_t: [-1125.186 -1125.186 -1125.186], eps: 1.0})
+Step:   47700, Reward: [-603.416 -603.416 -603.416] [145.573], Avg: [-516.231 -516.231 -516.231] (1.0000) ({r_i: None, r_t: [-1294.214 -1294.214 -1294.214], eps: 1.0})
+Step:   47800, Reward: [-541.682 -541.682 -541.682] [106.870], Avg: [-516.284 -516.284 -516.284] (1.0000) ({r_i: None, r_t: [-940.433 -940.433 -940.433], eps: 1.0})
+Step:   47900, Reward: [-477.852 -477.852 -477.852] [79.086], Avg: [-516.204 -516.204 -516.204] (1.0000) ({r_i: None, r_t: [-1234.881 -1234.881 -1234.881], eps: 1.0})
+Step:   48000, Reward: [-507.646 -507.646 -507.646] [81.522], Avg: [-516.186 -516.186 -516.186] (1.0000) ({r_i: None, r_t: [-941.735 -941.735 -941.735], eps: 1.0})
+Step:   48100, Reward: [-492.777 -492.777 -492.777] [110.594], Avg: [-516.137 -516.137 -516.137] (1.0000) ({r_i: None, r_t: [-978.699 -978.699 -978.699], eps: 1.0})
+Step:   48200, Reward: [-528.553 -528.553 -528.553] [22.959], Avg: [-516.163 -516.163 -516.163] (1.0000) ({r_i: None, r_t: [-953.627 -953.627 -953.627], eps: 1.0})
+Step:   48300, Reward: [-598.794 -598.794 -598.794] [168.093], Avg: [-516.334 -516.334 -516.334] (1.0000) ({r_i: None, r_t: [-994.561 -994.561 -994.561], eps: 1.0})
+Step:   48400, Reward: [-426.313 -426.313 -426.313] [109.101], Avg: [-516.148 -516.148 -516.148] (1.0000) ({r_i: None, r_t: [-947.000 -947.000 -947.000], eps: 1.0})
+Step:   48500, Reward: [-517.006 -517.006 -517.006] [49.815], Avg: [-516.150 -516.150 -516.150] (1.0000) ({r_i: None, r_t: [-1027.286 -1027.286 -1027.286], eps: 1.0})
+Step:   48600, Reward: [-552.427 -552.427 -552.427] [112.851], Avg: [-516.225 -516.225 -516.225] (1.0000) ({r_i: None, r_t: [-1083.799 -1083.799 -1083.799], eps: 1.0})
+Step:   48700, Reward: [-470.106 -470.106 -470.106] [60.733], Avg: [-516.130 -516.130 -516.130] (1.0000) ({r_i: None, r_t: [-937.064 -937.064 -937.064], eps: 1.0})
+Step:   48800, Reward: [-442.590 -442.590 -442.590] [83.488], Avg: [-515.980 -515.980 -515.980] (1.0000) ({r_i: None, r_t: [-1149.531 -1149.531 -1149.531], eps: 1.0})
+Step:   48900, Reward: [-540.342 -540.342 -540.342] [24.163], Avg: [-516.029 -516.029 -516.029] (1.0000) ({r_i: None, r_t: [-1173.115 -1173.115 -1173.115], eps: 1.0})
+Step:   49000, Reward: [-585.429 -585.429 -585.429] [70.667], Avg: [-516.171 -516.171 -516.171] (1.0000) ({r_i: None, r_t: [-1014.868 -1014.868 -1014.868], eps: 1.0})
+Step:   49100, Reward: [-550.448 -550.448 -550.448] [158.606], Avg: [-516.240 -516.240 -516.240] (1.0000) ({r_i: None, r_t: [-1039.294 -1039.294 -1039.294], eps: 1.0})
+Step:   49200, Reward: [-543.940 -543.940 -543.940] [81.410], Avg: [-516.297 -516.297 -516.297] (1.0000) ({r_i: None, r_t: [-1083.047 -1083.047 -1083.047], eps: 1.0})
+Step:   49300, Reward: [-543.766 -543.766 -543.766] [77.221], Avg: [-516.352 -516.352 -516.352] (1.0000) ({r_i: None, r_t: [-1044.594 -1044.594 -1044.594], eps: 1.0})
+Step:   49400, Reward: [-511.168 -511.168 -511.168] [18.948], Avg: [-516.342 -516.342 -516.342] (1.0000) ({r_i: None, r_t: [-975.970 -975.970 -975.970], eps: 1.0})
+Step:   49500, Reward: [-495.880 -495.880 -495.880] [11.123], Avg: [-516.300 -516.300 -516.300] (1.0000) ({r_i: None, r_t: [-979.184 -979.184 -979.184], eps: 1.0})
+Step:   49600, Reward: [-680.485 -680.485 -680.485] [94.513], Avg: [-516.631 -516.631 -516.631] (1.0000) ({r_i: None, r_t: [-1079.693 -1079.693 -1079.693], eps: 1.0})
+Step:   49700, Reward: [-526.105 -526.105 -526.105] [103.187], Avg: [-516.650 -516.650 -516.650] (1.0000) ({r_i: None, r_t: [-993.381 -993.381 -993.381], eps: 1.0})
+Step:   49800, Reward: [-566.829 -566.829 -566.829] [85.236], Avg: [-516.750 -516.750 -516.750] (1.0000) ({r_i: None, r_t: [-993.948 -993.948 -993.948], eps: 1.0})
+Step:   49900, Reward: [-473.323 -473.323 -473.323] [64.454], Avg: [-516.664 -516.664 -516.664] (1.0000) ({r_i: None, r_t: [-1039.889 -1039.889 -1039.889], eps: 1.0})
+Step:   50000, Reward: [-484.980 -484.980 -484.980] [82.833], Avg: [-516.600 -516.600 -516.600] (1.0000) ({r_i: None, r_t: [-1080.584 -1080.584 -1080.584], eps: 1.0})
+Step:   50100, Reward: [-509.372 -509.372 -509.372] [139.291], Avg: [-516.586 -516.586 -516.586] (1.0000) ({r_i: None, r_t: [-1099.706 -1099.706 -1099.706], eps: 1.0})
+Step:   50200, Reward: [-553.659 -553.659 -553.659] [108.364], Avg: [-516.660 -516.660 -516.660] (1.0000) ({r_i: None, r_t: [-1011.754 -1011.754 -1011.754], eps: 1.0})
+Step:   50300, Reward: [-479.701 -479.701 -479.701] [59.649], Avg: [-516.586 -516.586 -516.586] (1.0000) ({r_i: None, r_t: [-1024.613 -1024.613 -1024.613], eps: 1.0})
+Step:   50400, Reward: [-471.837 -471.837 -471.837] [45.478], Avg: [-516.498 -516.498 -516.498] (1.0000) ({r_i: None, r_t: [-1209.312 -1209.312 -1209.312], eps: 1.0})
+Step:   50500, Reward: [-394.376 -394.376 -394.376] [65.596], Avg: [-516.256 -516.256 -516.256] (1.0000) ({r_i: None, r_t: [-953.889 -953.889 -953.889], eps: 1.0})
+Step:   50600, Reward: [-480.149 -480.149 -480.149] [90.437], Avg: [-516.185 -516.185 -516.185] (1.0000) ({r_i: None, r_t: [-994.190 -994.190 -994.190], eps: 1.0})
+Step:   50700, Reward: [-599.284 -599.284 -599.284] [136.954], Avg: [-516.349 -516.349 -516.349] (1.0000) ({r_i: None, r_t: [-1023.550 -1023.550 -1023.550], eps: 1.0})
+Step:   50800, Reward: [-443.260 -443.260 -443.260] [78.960], Avg: [-516.205 -516.205 -516.205] (1.0000) ({r_i: None, r_t: [-969.560 -969.560 -969.560], eps: 1.0})
+Step:   50900, Reward: [-548.028 -548.028 -548.028] [113.779], Avg: [-516.267 -516.267 -516.267] (1.0000) ({r_i: None, r_t: [-1096.535 -1096.535 -1096.535], eps: 1.0})
+Step:   51000, Reward: [-413.522 -413.522 -413.522] [62.216], Avg: [-516.066 -516.066 -516.066] (1.0000) ({r_i: None, r_t: [-1019.139 -1019.139 -1019.139], eps: 1.0})
+Step:   51100, Reward: [-524.096 -524.096 -524.096] [70.622], Avg: [-516.082 -516.082 -516.082] (1.0000) ({r_i: None, r_t: [-1108.047 -1108.047 -1108.047], eps: 1.0})
+Step:   51200, Reward: [-593.517 -593.517 -593.517] [108.947], Avg: [-516.233 -516.233 -516.233] (1.0000) ({r_i: None, r_t: [-1020.108 -1020.108 -1020.108], eps: 1.0})
+Step:   51300, Reward: [-501.849 -501.849 -501.849] [161.321], Avg: [-516.205 -516.205 -516.205] (1.0000) ({r_i: None, r_t: [-995.388 -995.388 -995.388], eps: 1.0})
+Step:   51400, Reward: [-569.377 -569.377 -569.377] [86.307], Avg: [-516.308 -516.308 -516.308] (1.0000) ({r_i: None, r_t: [-1012.775 -1012.775 -1012.775], eps: 1.0})
+Step:   51500, Reward: [-516.918 -516.918 -516.918] [93.073], Avg: [-516.309 -516.309 -516.309] (1.0000) ({r_i: None, r_t: [-1293.364 -1293.364 -1293.364], eps: 1.0})
+Step:   51600, Reward: [-501.016 -501.016 -501.016] [64.761], Avg: [-516.280 -516.280 -516.280] (1.0000) ({r_i: None, r_t: [-1068.253 -1068.253 -1068.253], eps: 1.0})
+Step:   51700, Reward: [-488.035 -488.035 -488.035] [31.327], Avg: [-516.225 -516.225 -516.225] (1.0000) ({r_i: None, r_t: [-1048.254 -1048.254 -1048.254], eps: 1.0})
+Step:   51800, Reward: [-535.735 -535.735 -535.735] [111.098], Avg: [-516.263 -516.263 -516.263] (1.0000) ({r_i: None, r_t: [-1088.063 -1088.063 -1088.063], eps: 1.0})
+Step:   51900, Reward: [-504.255 -504.255 -504.255] [50.582], Avg: [-516.240 -516.240 -516.240] (1.0000) ({r_i: None, r_t: [-1097.823 -1097.823 -1097.823], eps: 1.0})
+Step:   52000, Reward: [-496.357 -496.357 -496.357] [143.262], Avg: [-516.202 -516.202 -516.202] (1.0000) ({r_i: None, r_t: [-1224.434 -1224.434 -1224.434], eps: 1.0})
+Step:   52100, Reward: [-443.462 -443.462 -443.462] [47.813], Avg: [-516.062 -516.062 -516.062] (1.0000) ({r_i: None, r_t: [-952.896 -952.896 -952.896], eps: 1.0})
+Step:   52200, Reward: [-415.917 -415.917 -415.917] [59.978], Avg: [-515.871 -515.871 -515.871] (1.0000) ({r_i: None, r_t: [-1044.182 -1044.182 -1044.182], eps: 1.0})
+Step:   52300, Reward: [-468.709 -468.709 -468.709] [74.535], Avg: [-515.781 -515.781 -515.781] (1.0000) ({r_i: None, r_t: [-1005.302 -1005.302 -1005.302], eps: 1.0})
+Step:   52400, Reward: [-481.181 -481.181 -481.181] [77.421], Avg: [-515.715 -515.715 -515.715] (1.0000) ({r_i: None, r_t: [-1012.101 -1012.101 -1012.101], eps: 1.0})
+Step:   52500, Reward: [-568.472 -568.472 -568.472] [114.346], Avg: [-515.815 -515.815 -515.815] (1.0000) ({r_i: None, r_t: [-1014.704 -1014.704 -1014.704], eps: 1.0})
+Step:   52600, Reward: [-513.642 -513.642 -513.642] [158.909], Avg: [-515.811 -515.811 -515.811] (1.0000) ({r_i: None, r_t: [-932.139 -932.139 -932.139], eps: 1.0})
+Step:   52700, Reward: [-506.188 -506.188 -506.188] [63.018], Avg: [-515.793 -515.793 -515.793] (1.0000) ({r_i: None, r_t: [-1068.286 -1068.286 -1068.286], eps: 1.0})
+Step:   52800, Reward: [-404.336 -404.336 -404.336] [36.813], Avg: [-515.582 -515.582 -515.582] (1.0000) ({r_i: None, r_t: [-1091.898 -1091.898 -1091.898], eps: 1.0})
+Step:   52900, Reward: [-624.965 -624.965 -624.965] [168.222], Avg: [-515.789 -515.789 -515.789] (1.0000) ({r_i: None, r_t: [-1121.376 -1121.376 -1121.376], eps: 1.0})
+Step:   53000, Reward: [-491.210 -491.210 -491.210] [100.250], Avg: [-515.742 -515.742 -515.742] (1.0000) ({r_i: None, r_t: [-1154.463 -1154.463 -1154.463], eps: 1.0})
+Step:   53100, Reward: [-509.814 -509.814 -509.814] [51.364], Avg: [-515.731 -515.731 -515.731] (1.0000) ({r_i: None, r_t: [-909.472 -909.472 -909.472], eps: 1.0})
+Step:   53200, Reward: [-487.387 -487.387 -487.387] [68.660], Avg: [-515.678 -515.678 -515.678] (1.0000) ({r_i: None, r_t: [-1062.512 -1062.512 -1062.512], eps: 1.0})
+Step:   53300, Reward: [-560.012 -560.012 -560.012] [163.516], Avg: [-515.761 -515.761 -515.761] (1.0000) ({r_i: None, r_t: [-943.043 -943.043 -943.043], eps: 1.0})
+Step:   53400, Reward: [-606.286 -606.286 -606.286] [181.682], Avg: [-515.930 -515.930 -515.930] (1.0000) ({r_i: None, r_t: [-1079.156 -1079.156 -1079.156], eps: 1.0})
+Step:   53500, Reward: [-490.696 -490.696 -490.696] [77.604], Avg: [-515.883 -515.883 -515.883] (1.0000) ({r_i: None, r_t: [-980.796 -980.796 -980.796], eps: 1.0})
+Step:   53600, Reward: [-636.900 -636.900 -636.900] [169.361], Avg: [-516.108 -516.108 -516.108] (1.0000) ({r_i: None, r_t: [-880.108 -880.108 -880.108], eps: 1.0})
+Step:   53700, Reward: [-541.516 -541.516 -541.516] [71.869], Avg: [-516.156 -516.156 -516.156] (1.0000) ({r_i: None, r_t: [-1137.838 -1137.838 -1137.838], eps: 1.0})
+Step:   53800, Reward: [-566.691 -566.691 -566.691] [52.225], Avg: [-516.249 -516.249 -516.249] (1.0000) ({r_i: None, r_t: [-1128.116 -1128.116 -1128.116], eps: 1.0})
+Step:   53900, Reward: [-560.724 -560.724 -560.724] [97.847], Avg: [-516.332 -516.332 -516.332] (1.0000) ({r_i: None, r_t: [-997.741 -997.741 -997.741], eps: 1.0})
+Step:   54000, Reward: [-427.232 -427.232 -427.232] [57.443], Avg: [-516.167 -516.167 -516.167] (1.0000) ({r_i: None, r_t: [-1046.457 -1046.457 -1046.457], eps: 1.0})
+Step:   54100, Reward: [-530.663 -530.663 -530.663] [83.057], Avg: [-516.194 -516.194 -516.194] (1.0000) ({r_i: None, r_t: [-1031.994 -1031.994 -1031.994], eps: 1.0})
+Step:   54200, Reward: [-654.196 -654.196 -654.196] [144.092], Avg: [-516.448 -516.448 -516.448] (1.0000) ({r_i: None, r_t: [-1059.401 -1059.401 -1059.401], eps: 1.0})
+Step:   54300, Reward: [-516.686 -516.686 -516.686] [35.769], Avg: [-516.448 -516.448 -516.448] (1.0000) ({r_i: None, r_t: [-1169.248 -1169.248 -1169.248], eps: 1.0})
+Step:   54400, Reward: [-486.112 -486.112 -486.112] [101.128], Avg: [-516.393 -516.393 -516.393] (1.0000) ({r_i: None, r_t: [-1128.289 -1128.289 -1128.289], eps: 1.0})
+Step:   54500, Reward: [-531.917 -531.917 -531.917] [80.780], Avg: [-516.421 -516.421 -516.421] (1.0000) ({r_i: None, r_t: [-1071.866 -1071.866 -1071.866], eps: 1.0})
+Step:   54600, Reward: [-480.916 -480.916 -480.916] [32.792], Avg: [-516.356 -516.356 -516.356] (1.0000) ({r_i: None, r_t: [-1073.876 -1073.876 -1073.876], eps: 1.0})
+Step:   54700, Reward: [-668.329 -668.329 -668.329] [105.586], Avg: [-516.634 -516.634 -516.634] (1.0000) ({r_i: None, r_t: [-1157.200 -1157.200 -1157.200], eps: 1.0})
+Step:   54800, Reward: [-535.577 -535.577 -535.577] [116.064], Avg: [-516.668 -516.668 -516.668] (1.0000) ({r_i: None, r_t: [-1043.248 -1043.248 -1043.248], eps: 1.0})
+Step:   54900, Reward: [-621.710 -621.710 -621.710] [103.755], Avg: [-516.859 -516.859 -516.859] (1.0000) ({r_i: None, r_t: [-1046.281 -1046.281 -1046.281], eps: 1.0})
+Step:   55000, Reward: [-487.438 -487.438 -487.438] [18.391], Avg: [-516.806 -516.806 -516.806] (1.0000) ({r_i: None, r_t: [-959.287 -959.287 -959.287], eps: 1.0})
+Step:   55100, Reward: [-560.638 -560.638 -560.638] [119.006], Avg: [-516.885 -516.885 -516.885] (1.0000) ({r_i: None, r_t: [-1126.754 -1126.754 -1126.754], eps: 1.0})
+Step:   55200, Reward: [-558.069 -558.069 -558.069] [129.501], Avg: [-516.960 -516.960 -516.960] (1.0000) ({r_i: None, r_t: [-927.748 -927.748 -927.748], eps: 1.0})

@@ -1,129 +1,124 @@
 import gym
-import torch
 import pickle
 import numpy as np
-from collections import deque
-from torchvision import transforms
-from utils.multiprocess import Manager, Worker
-from utils.misc import rgb2gray, resize
+from mpi4py import MPI
+from utils.multiprocess import TCPClient, TCPServer, MPIConnection, MPI_SIZE, MPI_RANK
 
-FRAME_STACK = 2					# The number of consecutive image states to combine for training a3c on raw images
 NUM_ENVS = 16					# The default number of environments to simultaneously train the a3c in parallel
+MPI_COMM = MPI.COMM_WORLD
+MPI_SIZE = MPI_COMM.Get_size()
 
-class RawStack():
-	def __init__(self, state_size, num_envs=1, stack_len=FRAME_STACK, load="", gpu=True):
-		self.state_size = state_size
-		self.stack_len = stack_len
-		self.reset(num_envs)
+def get_space_size(space):
+	if isinstance(space, gym.spaces.MultiDiscrete): return [*space.shape, space.nvec[0]]
+	if isinstance(space, gym.spaces.Discrete): return [space.n]
+	if isinstance(space, gym.spaces.Box): return space.shape
+	if isinstance(space, list): return [get_space_size(sp) for sp in space]
+	raise ValueError()
 
-	def reset(self, num_envs, restore=False):
-		pass
+def stack(values):
+	if isinstance(values[0], list): return [stack(arr) for arr in zip(*values)]
+	return np.stack(values)
 
-	def get_state(self, state):
-		return state
-
-	def step(self, state, env_action):
-		pass
-
-class ImgStack():
-	def __init__(self, state_size, num_envs=1, stack_len=FRAME_STACK, load="", gpu=True):
-		self.process = lambda x: np.expand_dims(np.transpose(resize(rgb2gray(x) if x.shape[-1] == 3 else x), (2,0,1)), 0)
-		self.state_size = [*self.process(np.zeros(state_size)).shape[-2:], (1 if state_size[-1]==3 else state_size[-1])*stack_len]
-		self.stack_len = stack_len
-		self.reset(num_envs)
-
-	def reset(self, num_envs, restore=False):
-		self.num_envs = num_envs
-		self.stack = deque(maxlen=self.stack_len)
-
-	def get_state(self, state):
-		state = np.concatenate([self.process(s) for s in state]) if self.num_envs > 1 else self.process(state)
-		while len(self.stack) < self.stack_len: self.stack.append(state)
-		self.stack.append(state)
-		return np.concatenate(self.stack, axis=1)
-
-	def step(self, state, env_action):
-		pass
+def unstack(values):
+	if isinstance(values, list): return [unstack(arr) for arr in zip(*values)]
+	return values
 
 class EnsembleEnv():
 	def __init__(self, make_env, num_envs=NUM_ENVS):
+		self.num_envs = num_envs
 		self.env = make_env()
 		self.envs = [make_env() for _ in range(num_envs)]
-		self.state_size = [self.env.observation_space.n] if hasattr(self.env.observation_space, "n") else self.env.observation_space.shape
-		self.action_size = [self.env.action_space.n] if hasattr(self.env.action_space, "n") else self.env.action_space.shape
+		self.test_envs = [make_env() for _ in range(num_envs)]
+		self.state_size = get_space_size(self.env.observation_space)
+		self.action_size = get_space_size(self.env.action_space)
+		self.action_space = self.env.action_space
 
-	def reset(self):
-		states = [env.reset() for env in self.envs]
-		return np.stack(states)
+	def reset(self, train=False):
+		obs = [env.reset() for env in (self.envs if train else self.test_envs)]
+		return stack(obs)
 
-	def step(self, actions, render=False):
+	def step(self, actions, train=False, render=False):
 		results = []
-		for env,action in zip(self.envs, actions):
-			ob, rew, done, info = env.step(action)
-			ob = env.reset() if done else ob
-			results.append((ob, rew, done, info))
+		actions = unstack(actions)
+		envs = self.envs if train else self.test_envs
+		for env,action in zip(envs, actions):
+			state, rew, done, info = env.step(action, train)
+			state = env.reset() if train and np.all(done) else state
+			results.append((state, rew, done, info))
 			if render: env.render()
 		obs, rews, dones, infos = zip(*results)
-		return np.stack(obs), np.stack(rews), np.stack(dones), infos
+		return stack(obs), stack(rews), stack(dones), infos
+
+	def render(self, train=False):
+		self.test_envs[0].render()
 
 	def close(self):
 		self.env.close()
-		for env in self.envs:
-			env.close()
+		for env in self.envs: env.close()
+		for env in self.test_envs: env.close()
 
 	def __del__(self):
 		self.close()
 
-class EnvWorker(Worker):
-	def __init__(self, self_port, make_env):
-		super().__init__(self_port)
+class EnvManager():
+	def __init__(self, make_env, server_ports):
 		self.env = make_env()
+		self.state_size = get_space_size(self.env.observation_space)
+		self.action_size = get_space_size(self.env.action_space)
+		self.action_space = self.env.action_space
+		self.conn = TCPClient(server_ports) if MPI_SIZE==1 else MPIConnection()
+		self.num_envs = len(server_ports) if MPI_SIZE==1 else MPI_SIZE-1
 
-	def start(self):
-		step = 0
-		rewards = 0
-		while True:
-			data = pickle.loads(self.conn.recv(100000))
-			if data["cmd"] == "RESET":
-				message = self.env.reset()
-				rewards = 0
-			elif data["cmd"] == "STEP":
-				state, reward, done, info = self.env.step(data["item"])
-				state = self.env.reset() if done else state
-				rewards += reward
-				step += 1
-				message = (state, reward, done, info)
-				if data["render"]: self.env.render()
-				if done: 
-					print(f"Step: {step}, Reward: {rewards}")
-					rewards = 0
-			elif data["cmd"] == "CLOSE":
-				self.env.close()
-				return
-			self.conn.sendall(pickle.dumps(message))
+	def reset(self, train=False):
+		self.conn.broadcast([{"cmd": "RESET", "item": [0.0], "train": train} for _ in range(self.num_envs)])
+		obs = self.conn.gather()
+		return stack(obs)
 
-class EnvManager(Manager):
-	def __init__(self, make_env, client_ports):
-		super().__init__(client_ports=client_ports)
-		self.num_envs = len(client_ports)
-		self.env = make_env()
-		self.state_size = [self.env.observation_space.n] if hasattr(self.env.observation_space, "n") else self.env.observation_space.shape
-		self.action_size = [self.env.action_space.n] if hasattr(self.env.action_space, "n") else self.env.action_space.shape
-
-	def reset(self):
-		self.send_params([pickle.dumps({"cmd": "RESET", "item": [0.0]}) for _ in range(self.num_envs)], encoded=True)
-		states = self.await_results(converter=pickle.loads, decoded=True)
-		return np.stack(states)
-
-	def step(self, actions, render=False):
-		self.send_params([pickle.dumps({"cmd": "STEP", "item": action, "render": render}) for action in actions], encoded=True)
-		results = self.await_results(converter=pickle.loads, decoded=True)
+	def step(self, actions, train=False, render=False):
+		actions = unstack(actions)
+		self.conn.broadcast([{"cmd": "STEP", "item": action, "render": render, "train": train} for action in actions])
+		results = self.conn.gather()
 		obs, rews, dones, infos = zip(*results)
-		return np.stack(obs), np.stack(rews), np.stack(dones), infos
+		return stack(obs), stack(rews), stack(dones), infos
+
+	def render(self, num=1, train=False):
+		self.conn.broadcast([{"cmd": "RENDER", "train": train} for _ in range(min(num, self.num_envs))])
 
 	def close(self):
 		self.env.close()
-		self.send_params([pickle.dumps({"cmd": "CLOSE", "item": [0.0]}) for _ in range(self.num_envs)], encoded=True)
+		self.conn.broadcast([{"cmd": "CLOSE", "item": [0.0]} for _ in range(self.num_envs)])
 
 	def __del__(self):
 		self.close()
+
+class EnvWorker():
+	def __init__(self, self_port, make_env):
+		self.env = [make_env(), make_env()]
+		self.conn = TCPServer(self_port) if MPI_SIZE==1 else MPIConnection()
+
+	def start(self, log=MPI_SIZE==1):
+		step = 0
+		rewards = [None, None]
+		while True:
+			data = self.conn.recv()
+			train = data.get("train", False)
+			env = self.env[int(train)]
+			if data["cmd"] == "RESET":
+				message = env.reset()
+				rewards[int(train)] = None
+			elif data["cmd"] == "STEP":
+				state, reward, done, info = env.step(data["item"], train)
+				state = env.reset() if train and np.all(done) else state
+				rewards[int(train)] = np.array(reward) if rewards[int(train)] is None else rewards[int(train)] + np.array(reward)
+				message = (state, reward, done, info)
+				step += int(train)
+				if log and train and np.all(done): 
+					print(f"Step: {step}, Reward: {rewards[int(train)]}")
+					rewards[int(train)] = None
+			elif data["cmd"] == "RENDER":
+				env.render()
+				continue
+			elif data["cmd"] == "CLOSE":
+				[env.close() for env in self.env]
+				return
+			self.conn.send(message)

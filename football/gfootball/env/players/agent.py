@@ -12,24 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Agent player controlled by the training policy and using step/reset API."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from gfootball.env import player_base
-
+from football.gfootball.env import player_base
 
 class Player(player_base.PlayerBase):
+    def __init__(self, player_config, env_config):
+        player_base.PlayerBase.__init__(self, player_config)
+        assert player_config['player_agent'] == 0, 'Only one \'agent\' player allowed'
+        self._action = None
 
-  def __init__(self, player_config, env_config):
-    player_base.PlayerBase.__init__(self, player_config)
-    assert player_config['player_agent'] == 0, 'Only one \'agent\' player allowed'
-    self._action = None
+    def set_action(self, action):
+        self._action = action
 
-  def set_action(self, action):
-    self._action = action
-
-  def take_action(self, observations):
-    return self._action
+    def take_action(self, observations):
+        return self._action

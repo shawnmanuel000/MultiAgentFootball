@@ -1,0 +1,230 @@
+Model: <class 'multiagent.coma.COMAAgent'>, Dir: simple_spread, Date: 13/03/2020 01:20:56
+num_envs: 4,
+state_size: [(1, 18), (1, 18), (1, 18)],
+action_size: [[1, 5], [1, 5], [1, 5]],
+action_space: [MultiDiscrete([5]), MultiDiscrete([5]), MultiDiscrete([5])],
+envs: <class 'utils.envs.EnsembleEnv'>,
+reward_shape: True,
+icm: False,
+
+import torch
+import numpy as np
+from models.rand import MultiagentReplayBuffer3
+from utils.network import PTACNetwork, PTACAgent, PTCritic, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, EPS_MIN, ADVANTAGE_DECAY, DISCOUNT_RATE, one_hot_from_indices
+
+EPS_MIN = 0.1               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.99             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+LEARN_RATE = 0.0001				# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001		# How frequently we want to copy the local network to the target network (for double DQNs)
+REPLAY_BATCH_SIZE = 10			# Number of episodes to train on for each train step
+EPISODE_BUFFER = 64				# Sets the maximum length of the replay buffer
+TIME_BATCHES = 100				# The number of batches of time steps to train critic in reverse time sequence
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+
+class COMAActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], ACTOR_HIDDEN)
+		self.layer2 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_probs = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, eps):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		action_probs = self.action_probs(state).softmax(-1)
+		action_probs = ((1 - eps) * action_probs + torch.ones_like(action_probs).to(state.device) * eps/action_probs.size(-1))
+		action = torch.distributions.Categorical(action_probs).sample().long()
+		return one_hot_from_indices(action, action_probs.size(-1)), action_probs
+
+class COMANetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=""):
+		self.actor = COMAActor([state_size[0][-1] + action_size[0][-1] + len(state_size)], action_size[0])
+		self.critic = lambda s,a: PTCritic([np.sum([np.prod(s) for s in state_size]) + 2*np.sum([np.prod(a) for a in action_size]) + state_size[0][-1] + len(state_size)], action_size[0])
+		super().__init__(state_size, action_size, actor=lambda s,a: self.actor, critic=self.critic, lr=lr, gpu=gpu, load=load, name="coma")
+
+	def get_action_probs(self, inputs, eps, grad=False, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, action_probs = self.actor_local(inputs, eps)
+			return [x.cpu().numpy() if numpy else x for x in [action, action_probs]]
+
+	def optimize(self, actions, critic_inputs, actor_inputs, rewards, dones, eps):
+		critic_losses = []
+		q_next_value = self.critic_target(critic_inputs)
+		q_next_taken = torch.gather(q_next_value, dim=-1, index=actions.argmax(-1, keepdims=True)).squeeze(-1)
+		q_next_taken = torch.cat([q_next_taken, torch.zeros_like(q_next_taken[:,-1]).unsqueeze(1)], dim=1)
+		q_target = self.compute_gae(rewards.unsqueeze(-1), dones.unsqueeze(-1), q_next_taken)
+		q_value = torch.zeros_like(q_next_value)
+		t_batch = max(rewards.size(1)//TIME_BATCHES, 1)
+		for t in reversed(range(0,min(rewards.size(1), t_batch*TIME_BATCHES),t_batch)):
+			q_value[:,t:t+t_batch] = self.critic_local(critic_inputs[:,t:t+t_batch])
+			q_taken = torch.gather(q_value[:,t:t+t_batch], dim=-1, index=actions[:,t:t+t_batch].argmax(-1, keepdims=True)).squeeze(-1)
+			critic_error = (q_taken - q_target[:,t:t+t_batch].detach())
+			critic_loss = critic_error.pow(2).mean()
+			critic_losses.append(critic_loss.detach().cpu().numpy())
+			self.step(self.critic_optimizer, critic_loss, self.critic_local.parameters(), retain=t>0)
+		self.soft_copy(self.critic_local, self.critic_target)
+
+		action_probs = self.get_action_probs(actor_inputs, eps, grad=True)[1]
+		q_value = q_value.reshape(-1, action_probs.shape[-1])
+		pi = action_probs.view(-1, action_probs.shape[-1])
+		baseline = (pi * q_value).sum(-1).detach()
+		q_taken = torch.gather(q_value, dim=1, index=actions.argmax(-1).reshape(-1, 1)).squeeze(1)
+		pi_taken = torch.gather(pi, dim=1, index=actions.argmax(-1).reshape(-1, 1)).squeeze(1)
+		advantages = (q_taken - baseline).detach()
+		actor_loss = - (advantages * pi_taken.log()).mean()
+		self.step(self.actor_optimizer, actor_loss, self.actor_local.parameters())
+		return [np.mean(critic_losses), np.mean(actor_loss.detach().cpu().numpy())]
+
+	@staticmethod
+	def compute_gae(rewards, done, target_qs, gamma=DISCOUNT_RATE, lamda=ADVANTAGE_DECAY):
+		ret = target_qs.new_zeros(*target_qs.shape)
+		ret[:,-1] = target_qs[:,-1]*(1-torch.sum(done, dim=1))
+		for t in range(ret.shape[1]-2, -1, -1):
+			ret[:,t] = lamda*gamma*ret[:,t+1] + (rewards[:,t]+(1-lamda)*gamma*target_qs[:,t+1]*(1-done[:,t]))
+		return ret[:,0:-1]
+
+class COMAAgent(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, COMANetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+		self.replay_buffer = MultiagentReplayBuffer3(EPISODE_BUFFER, state_size, action_size)
+		self.n_agents = len(action_size)
+		self.stats = []
+
+	def get_action(self, state, eps=None, sample=True, numpy=True):
+		eps = self.eps if eps is None else eps
+		obs = np.concatenate(state, -2)
+		if not hasattr(self, "action"): self.action = np.zeros([*obs.shape[:-1], self.action_size[0][-1]])
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.n_agents), 0), repeats=obs.shape[0], axis=0)
+		inputs = torch.from_numpy(np.concatenate([obs, self.action, agent_ids], -1)).float().to(self.network.device)
+		self.action = self.network.get_action_probs(inputs, eps=self.eps, numpy=True)[0]
+		return np.split(self.action, len(self.action_size), axis=-2)
+
+	def train(self, state, action, next_state, reward, done):
+		self.step = 0 if not hasattr(self, "step") else self.step + 1
+		self.buffer.append((state, action, reward, done))
+		if np.any(done[0]):
+			# states, actions, rewards, dones = map(lambda x: [np.stack(t, axis=1) for t in list(zip(*x))], zip(*self.buffer))
+			states, actions, rewards, dones = map(lambda x: torch.stack(self.to_tensor(x),2), zip(*self.buffer))
+			obs, actions = [x.squeeze(-2) for x in [states, actions]]
+			state = states.repeat(1,1,1,self.n_agents,1).view(*states.shape[:3],-1)
+			actions_joint = actions.view(*actions.shape[:2],1,-1).repeat(1,1,self.n_agents,1)
+			agent_mask = (1-torch.eye(self.n_agents, device=self.network.device))
+			agent_mask = agent_mask.view(-1, 1).repeat(1, self.action_size[0][-1]).view(self.n_agents, -1).unsqueeze(0).unsqueeze(0)
+			last_actions = torch.cat([torch.zeros_like(actions[:, 0:1]), actions[:, :-1]], dim=1)
+			last_actions_joint = last_actions.view(*last_actions.shape[:2],1,-1).repeat(1,1,self.n_agents,1)
+			agent_inds = torch.eye(self.n_agents, device=self.network.device).unsqueeze(0).unsqueeze(0).expand(*obs.shape[:2],-1,-1)
+			critic_inputs = torch.cat([state, obs, actions_joint * agent_mask, last_actions_joint, agent_inds], dim=-1)
+			actor_inputs = torch.cat([obs, last_actions, agent_inds], dim=-1)
+			self.replay_buffer.add([[self.to_numpy(x.transpose(0,1))] for x in (actions, critic_inputs, actor_inputs, rewards, dones)])
+			self.buffer.clear()
+		if (self.step % self.update_freq)==0 and len(self.replay_buffer) >= REPLAY_BATCH_SIZE:
+			# sample = self.replay_buffer.sample(REPLAY_BATCH_SIZE, lambda x: torch.Tensor(x).to(self.network.device))
+			# states, actions, rewards, dones = map(lambda x: torch.stack(x,2), sample)
+			actions, critic_inputs, actor_inputs, rewards, dones = self.replay_buffer.sample(REPLAY_BATCH_SIZE, lambda x: torch.Tensor(x[0]).to(self.network.device))
+			self.stats.append(self.network.optimize(actions, critic_inputs, actor_inputs, rewards.mean(-1), dones.mean(-1), self.eps))
+		if np.any(done[0]): self.eps = max(self.eps * self.decay, EPS_MIN)
+
+	def get_stats(self):
+		stats = {k:v for k,v in zip(["critic_loss", "actor_loss"], np.mean(self.stats, axis=0))} if len(self.stats)>0 else {}
+		self.stats = []
+		return {**stats, **super().get_stats()}
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.001   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 256				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 512				# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.998			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.001               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 1000000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import particle_envs.make_env as pgym
+# import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.sac import SACAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from multiagent.coma import COMAAgent
+from multiagent.maddpg import MADDPGAgent
+from multiagent.mappo import MAPPOAgent
+from utils.wrappers import ParallelAgent, DoubleAgent, SelfPlayAgent, ParticleTeamEnv, FootballTeamEnv, TrainEnv
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, MPI_SIZE, MPI_RANK
+from utils.misc import Logger, rollout
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+ptc_envs = ["simple_adversary", "simple_speaker_listener", "simple_tag", "simple_spread", "simple_push"]
+env_name = gym_envs[0]
+env_name = gfb_envs[-3]
+env_name = ptc_envs[-2]
+
+def make_env(env_name=env_name, log=False, render=False, reward_shape=False):
+	if env_name in gym_envs: return TrainEnv(gym.make(env_name))
+	if env_name in ptc_envs: return ParticleTeamEnv(pgym.make_env(env_name))
+	ballr = lambda x,y: (np.maximum if x>0 else np.minimum)(x - np.abs(y)*np.sign(x), 0.5*x)
+	reward_fn = lambda obs,reward,eps: [0.1*(ballr(o[0,88], o[0,89])) + r for o,r in zip(obs,reward)]
+	return FootballTeamEnv(ggym, env_name, reward_fn if reward_shape else None)
+
+def train(model, steps=10000, ports=16, env_name=env_name, trial_at=500, save_at=10, checkpoint=True, save_best=False, log=True, render=False, reward_shape=False, icm=False):
+	envs = (EnvManager if type(ports) == list or MPI_SIZE > 1 else EnsembleEnv)(lambda: make_env(env_name, reward_shape=reward_shape), ports)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, agent2=RandomAgent, save_dir=env_name, icm=icm) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), reward_shape=reward_shape, icm=icm)
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%trial_at == 0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.mean(rollouts, axis=-1))
+			if checkpoint and len(total_rewards) % save_at==0: agent.save_model(env_name, "checkpoint")
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})", agent.get_stats())
+
+def trial(model, env_name, render):
+	envs = EnsembleEnv(lambda: make_env(env_name, log=True, render=render), 0)
+	agent = (DoubleAgent if envs.env.self_play else ParallelAgent)(envs.state_size, envs.action_size, model, gpu=False, load=f"{env_name}", agent2=RandomAgent, save_dir=env_name)
+	print(f"Reward: {np.mean([rollout(envs.env, agent, eps=0.0, render=True) for _ in range(5)], axis=0)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[4], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="coma", help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=200000, help="Number of steps to train the agent")
+	parser.add_argument("--reward_shape", action="store_true", help="Whether to shape rewards for football")
+	parser.add_argument("--icm", action="store_true", help="Whether to use intrinsic motivation")
+	parser.add_argument("--render", action="store_true", help="Whether to render during training")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run")
+	parser.add_argument("--env", type=str, default="", help="Name of env to use")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	env_name = env_name if args.env not in [*gym_envs, *gfb_envs, *ptc_envs] else args.env
+	models = {"ddpg":DDPGAgent, "ppo":PPOAgent, "sac":SACAgent, "ddqn":DDQNAgent, "maddpg":MADDPGAgent, "mappo":MAPPOAgent, "coma":COMAAgent, "rand":RandomAgent}
+	model = models[args.model] if args.model in models else RandomAgent
+	if args.selfport is not None or MPI_RANK>0:
+		EnvWorker(self_port=args.selfport, make_env=make_env).start()
+	elif args.trial:
+		trial(model=model, env_name=env_name, render=args.render)
+	else:
+		train(model=model, steps=args.steps, ports=args.workerports[0] if len(args.workerports)==1 else args.workerports, env_name=env_name, render=args.render, reward_shape=args.reward_shape, icm=args.icm)
+
+
+Step:       0, Reward: [-503.351 -503.351 -503.351] [54.457], Avg: [-503.351 -503.351 -503.351] (1.0000) <00:00:00> ({r_i: None, r_t: [-9.773 -9.773 -9.773], eps: 1.0})

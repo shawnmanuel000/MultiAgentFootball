@@ -1,0 +1,297 @@
+Model: <class 'multiagent.coma.COMAAgent'>, Dir: 3_vs_3_custom
+num_envs: 16, state_size: (115,), action_size: [19], action_space: MultiDiscrete([19 19 19 19 19 19]),
+
+import torch
+import random
+import numpy as np
+from utils.wrappers import ParallelAgent
+from utils.network import PTNetwork, PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, NUM_STEPS, REG_LAMBDA, EPS_MIN
+
+BATCH_SIZE = 32					# Number of samples to train on for each train step
+EPS_DECAY = 0.995             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+
+class COMAActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.recurrent = torch.nn.GRUCell(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_probs = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		self.init_hidden()
+
+	def forward(self, state, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		out_dims = state.size()[:-1]
+		state = state.view(np.prod(out_dims), -1)
+		if self.hidden.size(0) != state.size(0): self.init_hidden(state.size(0))
+		self.hidden = self.recurrent(state, self.hidden)
+		action_probs = self.action_probs(self.hidden).softmax(-1)
+		action_probs = action_probs.view(*out_dims, -1)
+		return action_probs
+
+	def init_hidden(self, batch_size=1):
+		self.hidden = torch.zeros([batch_size, ACTOR_HIDDEN])
+
+class COMACritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.q_values = torch.nn.Linear(CRITIC_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		q_values = self.q_values(state)
+		return q_values
+
+class COMANetwork(PTNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(gpu=gpu)
+		actor_input = [np.sum(state_size) + action_size[-1]]
+		self.actor_local = COMAActor(actor_input, action_size)
+		self.actor_target = COMAActor(actor_input, action_size)
+		self.actor_optimizer = torch.optim.Adam(self.actor_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
+		
+		critic_input = [np.sum(state_size) + 2*action_size[-1]*state_size[0]]
+		self.critic_local = COMACritic(critic_input, action_size)
+		self.critic_target = COMACritic(critic_input, action_size)
+		self.critic_optimizer = torch.optim.Adam(self.critic_local.parameters(), lr=lr, weight_decay=REG_LAMBDA)
+		if load: self.load_model(load)
+		
+	def get_action_probs(self, state, sample=True, grad=True, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action_probs = self.actor_local(state.to(self.device), sample)
+			return action_probs.cpu().numpy() if numpy else action_probs
+
+	def get_value(self, state, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			q_values = self.critic_local(state.to(self.device))
+			return q_values
+
+	def optimize(self, states, actions, actor_inputs, critic_inputs, q_values, q_selecteds, q_targets):
+		for t in reversed(range(q_targets.size(0))):
+			q_values[t] = self.get_value(critic_inputs[t])
+			q_selected = torch.gather(q_values[t], dim=-1, index=actions[t].argmax(-1, keepdims=True))
+			critic_loss = (q_selected - q_targets[t].detach()).pow(2)
+			self.step(self.critic_optimizer, critic_loss.mean(), retain=True)
+
+		hidden = self.actor_local.hidden
+		action_probs = torch.stack([self.get_action_probs(actor_inputs[t]) for t in range(q_targets.size(0))], dim=0)
+		baseline = (action_probs * q_values[:-1]).sum(-1, keepdims=True).detach()
+		log_probs = torch.gather(action_probs, dim=-1, index=actions[:-1].argmax(-1, keepdims=True)).log()
+		advantages = (q_selecteds[:-1] - baseline).detach()
+		actor_loss = (advantages * log_probs).sum()
+		self.step(self.actor_optimizer, actor_loss.mean())
+		self.actor_local.hidden = hidden
+
+	def save_model(self, dirname="pytorch", name="best"):
+		PTACNetwork.save_model(self, "coma", dirname, name)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		PTACNetwork.load_model(self, "coma", dirname, name)
+
+class COMAAgent(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, decay=EPS_DECAY, gpu=True, load=None):
+		super().__init__(state_size, action_size, COMANetwork, lr=lr, update_freq=update_freq, decay=decay, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True, save=True):
+		if not hasattr(self, "action"): self.action = np.zeros([*state.shape[:-1], self.action_size[-1]])
+		eps = self.eps if eps is None else eps
+		batch_size = state.shape[0] if len(state.shape) > len(self.state_size) else 1
+		agent_ids = np.repeat(np.expand_dims(np.eye(self.state_size[0]), 0), repeats=batch_size, axis=0).squeeze()
+		last_action = self.action if len(state.shape) == len(self.action.shape) else np.zeros([*state.shape[:-1], self.action_size[-1]])
+		inputs = self.to_tensor(np.concatenate([state, last_action, agent_ids], axis=-1))
+		action_greedy = self.network.get_action_probs(inputs, sample=sample, grad=False, numpy=save)
+		action = (np.random.rand if save else torch.rand)(*action_greedy.shape) if random.random() < eps else action_greedy
+		if save: self.action = action.astype(np.float32)
+		return action
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, reward, done))
+		if done[0] or len(self.buffer) >= self.update_freq:
+			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			next_state = self.to_tensor(next_state)
+			states = torch.cat([states, next_state.unsqueeze(0)], dim=0)
+			actions = torch.cat([actions, self.get_action(next_state, save=False).unsqueeze(0)], dim=0)
+			dones = dones.unsqueeze(-1).repeat_interleave(self.state_size[0], dim=-1)
+
+			action_indices = actions.argmax(-1, keepdims=True)
+			actions_one_hot = torch.zeros_like(actions)
+			actions_one_hot.scatter_(-1, action_indices, 1)
+			actions_joint_one_hot = actions_one_hot.view(*actions.size()[:-2], 1, -1).repeat_interleave(self.state_size[0], dim=-2)
+			agent_mask = (1-torch.eye(self.state_size[0])).view(-1, 1).repeat(1, self.action_size[-1]).view(1, 1, self.state_size[0], -1)
+			last_actions = torch.cat([torch.zeros_like(actions_one_hot[0:1]), actions_one_hot[:-1]], dim=0)
+			last_actions_joint = last_actions.view(*actions.size()[:-2], 1, -1).repeat_interleave(self.state_size[0], dim=-2)
+			agent_ids = torch.eye(self.state_size[0]).unsqueeze(0).unsqueeze(0).expand(*actions.size()[:2], -1, -1)
+			critic_inputs = torch.cat([states, actions_joint_one_hot * agent_mask, last_actions_joint, agent_ids], dim=-1)
+			actor_inputs = torch.cat([states, last_actions, agent_ids], dim=-1)
+
+			q_values = self.network.get_value(critic_inputs, grad=False)
+			q_selecteds = torch.gather(q_values, dim=-1, index=actions.argmax(-1, keepdims=True))
+			q_targets, _ = self.compute_gae(q_selecteds[-1], rewards.unsqueeze(-1), dones.unsqueeze(-1), q_selecteds[:-1])
+			self.network.optimize(states, actions, actor_inputs, critic_inputs, q_values, q_selecteds, q_targets)
+		if done[0]: self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 100					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 10000      	# Sets the maximum length of the replay buffer
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+
+import gym
+import argparse
+import numpy as np
+import football.gfootball.env as ggym
+from models.ppo import PPOAgent
+from models.ddqn import DDQNAgent
+from models.ddpg import DDPGAgent
+from models.rand import RandomAgent
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker
+from utils.misc import Logger, rollout
+from utils.wrappers import ParallelAgent, SelfPlayAgent
+from multiagent.coma import COMAAgent
+np.set_printoptions(precision=3)
+
+gym_envs = ["CartPole-v0", "MountainCar-v0", "Acrobot-v1", "Pendulum-v0", "MountainCarContinuous-v0", "CarRacing-v0", "BipedalWalker-v2", "BipedalWalkerHardcore-v2", "LunarLander-v2", "LunarLanderContinuous-v2"]
+gfb_envs = ["academy_empty_goal_close", "academy_empty_goal", "academy_run_to_score", "academy_run_to_score_with_keeper", "academy_single_goal_versus_lazy", "academy_3_vs_1_with_keeper", "1_vs_1_easy", "3_vs_3_custom", "5_vs_5", "11_vs_11_stochastic", "test_example_multiagent"]
+env_name = gfb_envs[-4]
+
+def make_env(env_name=env_name, log=False, render=False):
+	if env_name in gym_envs: return gym.make(env_name)
+	reps = ["pixels", "pixels_gray", "extracted", "simple115"]
+	multiagent_args = {"number_of_left_players_agent_controls":3, "number_of_right_players_agent_controls":3} if env_name == "3_vs_3_custom" else {}
+	env = ggym.create_environment(env_name=env_name, representation=reps[3], logdir='/football/logs/', render=render, **multiagent_args)
+	env.unwrapped.spec = gym.envs.registration.EnvSpec(env_name + "-v0", max_episode_steps=env.unwrapped._config._scenario_cfg.game_duration)
+	if not hasattr(env.action_space, 'n'): env.action_space.n = env.action_space.nvec[0]
+	if log: print(f"State space: {env.observation_space.shape} \nAction space: {[*env.action_space.shape, env.action_space.n]}")
+	return env
+
+def run(model, steps=10000, ports=16, eval_at=1000, checkpoint=True, save_best=False, log=True):
+	num_envs = len(ports) if type(ports) == list else min(ports, 64)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports, render=False)
+	model = model if not type(envs.env.action_space) == gym.spaces.MultiDiscrete else COMAAgent
+	agent = SelfPlayAgent(envs.state_size, envs.action_size, model, num_envs=num_envs, gpu=False, agent2=RandomAgent) 
+	logger = Logger(model, env_name, num_envs=num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space)
+	states = envs.reset()
+	total_rewards = []
+	for s in range(steps):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if dones[0]:
+			rollouts = [rollout(envs.env, agent.reset(1)) for _ in range(5)]
+			test_reward = np.mean(rollouts, axis=0) - np.std(rollouts, axis=0)
+			total_rewards.append(test_reward)
+			if checkpoint: agent.save_model(env_name, "checkpoint")
+			if save_best and total_rewards[-1] >= max(total_rewards): agent.save_model(env_name)
+			if log: logger.log(f"Step: {s}, Reward: {test_reward+np.std(rollouts, axis=0)} [{np.std(rollouts):.4f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.agent.eps:.3f})")
+			agent.reset(num_envs)
+
+def trial(model):
+	envs = EnsembleEnv(make_env, 0, log=True, render=True)
+	agent = ParallelAgent(envs.state_size, envs.action_size, model, load=f"{env_name}")
+	print(f"Reward: {rollout(envs.env, agent, eps=0.02, render=True)}")
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[16], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--model", type=str, default="ddpg", choices=["ddqn", "ddpg", "ppo", "rand"], help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--test", action="store_true", help="Whether to show a trial run")
+	return parser.parse_args()
+
+if __name__ == "__main__":
+	args = parse_args()
+	model = DDPGAgent if args.model == "ddpg" else PPOAgent if args.model == "ppo" else DDQNAgent if args.model == "ddqn" else RandomAgent
+	if args.test:
+		trial(model)
+	elif args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		run(model, args.steps, args.workerports[0] if len(args.workerports)==1 else args.workerports)
+
+Step: 499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [0. 0. 0. 0. 0. 0.] (0.995)
+Step: 999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [0. 0. 0. 0. 0. 0.] (0.990)
+Step: 1499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.2   -0.2   -0.2   -0.067 -0.067 -0.067] (0.985)
+Step: 1999, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.2 -0.2 -0.2 -0.2 -0.2 -0.2] (0.980)
+Step: 2499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.28 -0.28 -0.28 -0.2  -0.2  -0.2 ] (0.975)
+Step: 2999, Reward: [0. 0. 0. 0. 0. 0.] [0.6325], Avg: [-0.339 -0.339 -0.339 -0.272 -0.272 -0.272] (0.970)
+Step: 3499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.29  -0.29  -0.29  -0.233 -0.233 -0.233] (0.966)
+Step: 3999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.329 -0.329 -0.329 -0.229 -0.229 -0.229] (0.961)
+Step: 4499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.359 -0.359 -0.359 -0.226 -0.226 -0.226] (0.956)
+Step: 4999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.383 -0.383 -0.383 -0.223 -0.223 -0.223] (0.951)
+Step: 5499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.348 -0.348 -0.348 -0.203 -0.203 -0.203] (0.946)
+Step: 5999, Reward: [0. 0. 0. 0. 0. 0.] [0.6325], Avg: [-0.372 -0.372 -0.372 -0.239 -0.239 -0.239] (0.942)
+Step: 6499, Reward: [-0.4 -0.4 -0.4  0.4  0.4  0.4] [0.6325], Avg: [-0.412 -0.412 -0.412 -0.227 -0.227 -0.227] (0.937)
+Step: 6999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.382 -0.382 -0.382 -0.211 -0.211 -0.211] (0.932)
+Step: 7499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.357 -0.357 -0.357 -0.197 -0.197 -0.197] (0.928)
+Step: 7999, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.347 -0.347 -0.347 -0.222 -0.222 -0.222] (0.923)
+Step: 8499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.327 -0.327 -0.327 -0.209 -0.209 -0.209] (0.918)
+Step: 8999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.342 -0.342 -0.342 -0.209 -0.209 -0.209] (0.914)
+Step: 9499, Reward: [ 0.6  0.6  0.6 -0.6 -0.6 -0.6] [0.7746], Avg: [-0.318 -0.318 -0.318 -0.255 -0.255 -0.255] (0.909)
+Step: 9999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.302 -0.302 -0.302 -0.242 -0.242 -0.242] (0.905)
+Step: 10499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.316 -0.316 -0.316 -0.24  -0.24  -0.24 ] (0.900)
+Step: 10999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.329 -0.329 -0.329 -0.238 -0.238 -0.238] (0.896)
+Step: 11499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.341 -0.341 -0.341 -0.237 -0.237 -0.237] (0.891)
+Step: 11999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.327 -0.327 -0.327 -0.227 -0.227 -0.227] (0.887)
+Step: 12499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.314 -0.314 -0.314 -0.218 -0.218 -0.218] (0.882)
+Step: 12999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.302 -0.302 -0.302 -0.209 -0.209 -0.209] (0.878)
+Step: 13499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.313 -0.313 -0.313 -0.209 -0.209 -0.209] (0.873)
+Step: 13999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.323 -0.323 -0.323 -0.209 -0.209 -0.209] (0.869)
+Step: 14499, Reward: [-0.4 -0.4 -0.4  0.4  0.4  0.4] [0.6325], Avg: [-0.343 -0.343 -0.343 -0.205 -0.205 -0.205] (0.865)
+Step: 14999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.331 -0.331 -0.331 -0.198 -0.198 -0.198] (0.860)
+Step: 15499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.32  -0.32  -0.32  -0.191 -0.191 -0.191] (0.856)
+Step: 15999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.329 -0.329 -0.329 -0.192 -0.192 -0.192] (0.852)
+Step: 16499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.337 -0.337 -0.337 -0.192 -0.192 -0.192] (0.848)
+Step: 16999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.345 -0.345 -0.345 -0.192 -0.192 -0.192] (0.843)
+Step: 17499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.335 -0.335 -0.335 -0.187 -0.187 -0.187] (0.839)
+Step: 17999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.326 -0.326 -0.326 -0.182 -0.182 -0.182] (0.835)
+Step: 18499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.317 -0.317 -0.317 -0.177 -0.177 -0.177] (0.831)
+Step: 18999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.309 -0.309 -0.309 -0.172 -0.172 -0.172] (0.827)
+Step: 19499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.301 -0.301 -0.301 -0.168 -0.168 -0.168] (0.822)
+Step: 19999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.293 -0.293 -0.293 -0.163 -0.163 -0.163] (0.818)
+Step: 20499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.286 -0.286 -0.286 -0.159 -0.159 -0.159] (0.814)
+Step: 20999, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.284 -0.284 -0.284 -0.17  -0.17  -0.17 ] (0.810)
+Step: 21499, Reward: [0. 0. 0. 0. 0. 0.] [0.6325], Avg: [-0.292 -0.292 -0.292 -0.181 -0.181 -0.181] (0.806)
+Step: 21999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.299 -0.299 -0.299 -0.181 -0.181 -0.181] (0.802)
+Step: 22499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.306 -0.306 -0.306 -0.181 -0.181 -0.181] (0.798)
+Step: 22999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.299 -0.299 -0.299 -0.178 -0.178 -0.178] (0.794)
+Step: 23499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.293 -0.293 -0.293 -0.174 -0.174 -0.174] (0.790)
+Step: 23999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.299 -0.299 -0.299 -0.174 -0.174 -0.174] (0.786)
+Step: 24499, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.297 -0.297 -0.297 -0.183 -0.183 -0.183] (0.782)
+Step: 24999, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.295 -0.295 -0.295 -0.191 -0.191 -0.191] (0.778)
+Step: 25499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.301 -0.301 -0.301 -0.192 -0.192 -0.192] (0.774)
+Step: 25999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.296 -0.296 -0.296 -0.188 -0.188 -0.188] (0.771)
+Step: 26499, Reward: [-0.4 -0.4 -0.4  0.4  0.4  0.4] [0.6325], Avg: [-0.307 -0.307 -0.307 -0.186 -0.186 -0.186] (0.767)
+Step: 26999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.301 -0.301 -0.301 -0.183 -0.183 -0.183] (0.763)
+Step: 27499, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.299 -0.299 -0.299 -0.19  -0.19  -0.19 ] (0.759)
+Step: 27999, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.305 -0.305 -0.305 -0.19  -0.19  -0.19 ] (0.755)
+Step: 28499, Reward: [-0.2 -0.2 -0.2  0.2  0.2  0.2] [0.4472], Avg: [-0.31 -0.31 -0.31 -0.19 -0.19 -0.19] (0.751)
+Step: 28999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.304 -0.304 -0.304 -0.187 -0.187 -0.187] (0.748)
+Step: 29499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.299 -0.299 -0.299 -0.184 -0.184 -0.184] (0.744)
+Step: 29999, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.298 -0.298 -0.298 -0.191 -0.191 -0.191] (0.740)
+Step: 30499, Reward: [ 0.2  0.2  0.2 -0.2 -0.2 -0.2] [0.4472], Avg: [-0.296 -0.296 -0.296 -0.198 -0.198 -0.198] (0.737)
+Step: 30999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.291 -0.291 -0.291 -0.194 -0.194 -0.194] (0.733)
+Step: 31499, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.287 -0.287 -0.287 -0.191 -0.191 -0.191] (0.729)
+Step: 31999, Reward: [0. 0. 0. 0. 0. 0.] [0.0000], Avg: [-0.282 -0.282 -0.282 -0.188 -0.188 -0.188] (0.726)
